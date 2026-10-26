@@ -1,0 +1,6 @@
+# Runtime dependencies of the Aero-VPA reference implementation.
+# Python >= 3.10 is required (zip(..., strict=True)). Self-tests verified with Python 3.13.17 and torch 2.14.1 (CPU).
+torch==2.14.1
+# Only for the default CLIP text tower (TextEncoderWrapper() without an injected model).
+# The self-tests use an offline stand-in and do not import it.
+transformers==5.19.0

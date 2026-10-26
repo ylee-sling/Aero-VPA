@@ -1,0 +1,4 @@
+# Runtime dependencies plus the linter used by scripts/check_release.py:
+#   ruff check --select F,E9,B,PLE,PLW .
+-r requirements.txt
+ruff==0.16.9

@@ -1,0 +1,36 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the preprint below."
+title: "Aero-VPA: reference implementation"
+type: software
+version: "1.0.0"
+date-released: "2026-10-26"
+authors:
+  - family-names: Lee
+    given-names: Yeonseok
+    email: ylee@sling.ai.kr
+    orcid: "https://orcid.org/0009-0004-6153-0205"
+    affiliation: "SLING AI Inc."
+repository-code: "https://github.com/ylee-sling/Aero-VPA"
+url: "https://github.com/ylee-sling/Aero-VPA"
+license: GPL-3.0-only
+keywords:
+  - aerial robotics
+  - joint-embedding predictive architecture
+  - flow matching
+  - edge computing
+  - safe learning-based control
+preferred-citation:
+  type: generic
+  title: "Aero-VPA: Few-Step Flow-Matching Control over Non-Reconstructive JEPA Latents for Agile Flight on Edge Hardware"
+  authors:
+    - family-names: Lee
+      given-names: Yeonseok
+      email: ylee@sling.ai.kr
+      orcid: "https://orcid.org/0009-0004-6153-0205"
+      affiliation: "SLING AI Inc."
+  publisher:
+    name: Zenodo
+  year: 2026
+  doi: "10.5281/zenodo.23633375"
+  url: "https://doi.org/10.5281/zenodo.23633375"
+  notes: "Preprint"

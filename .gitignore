@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.ruff_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Model artefacts and logs (weights are not part of this release)
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+*.plan
+runs/
+logs/
+wandb/
+checkpoints/
+
+# Archives and OS files
+*.zip
+*.tar.gz
+.DS_Store
+Thumbs.db
