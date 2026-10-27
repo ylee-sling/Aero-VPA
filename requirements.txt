@@ -4,3 +4,5 @@ torch==2.14.1
 # Only for the default CLIP text tower (TextEncoderWrapper() without an injected model).
 # The self-tests use an offline stand-in and do not import it.
 transformers==5.19.0
+# Demonstration files (dataset.py, inspect_hdf5.py, sim/): HDF5 I/O; NumPy comes with it.
+h5py==3.16.0

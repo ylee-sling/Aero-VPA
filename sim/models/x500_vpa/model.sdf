@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SPDX-License-Identifier: GPL-3.0-only
+  Copyright (C) 2026 SLING AI Inc.
+
+  x500_vpa: the PX4 x500_depth vehicle with its OakD-Lite replaced by aero_vpa_rgbd (same mount pose,
+  same mass), i.e. gz_x500_depth with an aligned RGB-D stream (preprint_261026.pdf, Sec. 5.1).
+  Flown with the unchanged gz_x500_depth airframe parameters: PX4_SYS_AUTOSTART=4002, PX4_SIM_MODEL=gz_x500_vpa.
+-->
+<sdf version="1.9">
+  <model name="x500_vpa">
+    <include merge="true">
+      <uri>x500</uri>
+    </include>
+    <include merge="true">
+      <uri>model://aero_vpa_rgbd</uri>
+      <pose>.12 .03 .242 0 0 0</pose>
+    </include>
+    <joint name="CameraJoint" type="fixed">
+      <parent>base_link</parent>
+      <child>camera_link</child>
+      <pose relative_to="base_link">.12 .03 .242 0 0 0</pose>
+    </joint>
+  </model>
+</sdf>

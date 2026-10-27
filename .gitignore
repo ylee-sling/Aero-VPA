@@ -21,6 +21,11 @@ venv/
 *.plan
 runs/
 logs/
+
+# Phase 1 data and generated worlds (regenerate with sim/make_world.py)
+*.hdf5
+*.h5
+sim/worlds/
 wandb/
 checkpoints/
 

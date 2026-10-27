@@ -49,9 +49,12 @@ time needed to stream billions of weights. Aero-VPA removes the decoder from the
 
 This repository contains the model and the closed-loop runtime in PyTorch: all networks of Table 1, the training
 objectives, the safety layer and Algorithm 1 (decision loop and 100 Hz executor), with offline self-tests.
+`sim/` adds the Phase 1 data pipeline: a headless Gazebo Harmonic + PX4 SITL stack, the privileged expert of
+Section 5.1, and an HDF5 writer whose files `dataset.py` loads for training stages (i) and (ii).
 The preprint specifies its benchmark protocol before execution and reports **no experimental results**; this
-release likewise ships **no trained weights and no flight results**. ROS 2 nodes, TensorRT engines and the
-SITL / HITL harness of Sections 4-5 are deployment targets of the paper and are not part of this release.
+release likewise ships **no trained weights, no demonstrations and no flight results**. ROS 2 control nodes,
+TensorRT engines and the HITL harness of Sections 4-5 are deployment targets of the paper and are not part of
+this release.
 
 ## Parameter budget (Table 1)
 
@@ -102,6 +105,8 @@ python predictor.py
 python selector.py
 python solver.py
 python pipeline.py
+python sim/expert.py       # expert planner, labels and HDF5 schema (cross-checked against selector.py)
+python dataset.py          # dry-run file -> inspect_hdf5 -> stage (i) and (ii) training steps
 
 # the release checks: headers, licence files, citation metadata, lint and all self-tests
 python scripts/check_release.py --run-tests
@@ -127,6 +132,64 @@ out.velocity, out.acceleration, out.yaw_rate                  # PX4 TrajectorySe
 `image` is the normalised RGB-D frame `[B, 4, 128, 160]` (see `perception.RGBDNormalizer`); `clearance` is the
 metric range $d_t$ `[B]` of Eq. 27, or a callable that receives the predicted chunk and returns it.
 
+## Phase 1: simulation data collection
+
+Expert demonstrations for stages (i) and (ii) (Secs. 3.8, 5.1) are collected in Gazebo Harmonic with PX4 SITL
+v1.17 on Ubuntu 22.04, headless, with GPU rendering through EGL. The vehicle is `x500_vpa`: the PX4
+`gz_x500_depth` airframe (parameters of autostart 4002, same OakD-Lite mount) whose two unaligned sensors
+(1920 × 1080 RGB and 640 × 480 depth, different fields of view, 30 Hz) are replaced by one `rgbd_camera` that
+renders colour and depth from the same viewpoint at the network resolution, 160 × 128, and at the knot rate
+of 50 Hz.
+
+```bash
+# 1. dry run (no ROS, no Gazebo): kinematic vehicle + ray-cast RGB-D, same recording code and schema
+python sim/collect_expert_dataset.py --dry_run --num_episodes 2 --output pilot_sample.hdf5
+python inspect_hdf5.py pilot_sample.hdf5
+
+# 2. pilot in Gazebo + PX4 (starts Xvfb/EGL, MicroXRCEAgent, gz, PX4, ros_gz_bridge; stops them on exit)
+sim/run_headless_sitl.sh --px4-dir ~/PX4-Autopilot --ros-ws ~/px4_ros_ws -- \
+    python3 sim/collect_expert_dataset.py --num_episodes 2 --output pilot_sample.hdf5
+python inspect_hdf5.py pilot_sample.hdf5                   # exit status 1 on any schema violation
+
+# 3. scale-up: 200 worlds x 10 flights = 2,000 demonstrations (Sec. 5.1); one stack per world,
+#    --instance N runs several stacks side by side (own DDS port, ROS domain and gz partition)
+python sim/make_world.py --seed 0 --count 200 --density sparse   # sim/worlds/*.sdf + privileged *.json
+for i in $(seq 0 199); do
+  w=$(printf aero_forest_sparse_s%04d "$i")
+  sim/run_headless_sitl.sh --px4-dir ~/PX4-Autopilot --ros-ws ~/px4_ros_ws --world "sim/worlds/$w.sdf" -- \
+      python3 sim/collect_expert_dataset.py --num_episodes 10 --seed "$i" --output "data/$w.hdf5"
+done
+python inspect_hdf5.py --quiet data/*.hdf5
+```
+
+```python
+from dataset import make_dataloader, text_conditioning
+stage1 = make_dataloader("data/*.hdf5", stage=1, batch_size=256, num_workers=8)  # I_t, S_t, u_t, a_bar_t, I_{t+0.1 s}
+stage2 = make_dataloader("data/*.hdf5", stage=2, batch_size=256, num_workers=8)  # I_t, S_t, g_t, x, A_t, u*_t
+```
+
+Each sample is one RGB-D frame. The odometry is paired by interpolation at the frame's capture time (PX4
+stamps in simulation time, `UXRCE_DDS_SYNCT=0`), `S_t` carries the setpoint dispatched most recently before
+it, and the 16-knot expert chunk is evaluated at the same instant in the heading frame of that instant.
+Episode layout (`sim/expert.py` documents every attribute):
+
+| Dataset | Shape | Type | Content |
+| :--- | :--- | :--- | :--- |
+| `observations/images` | (T, 128, 160, 4) | uint16 | R, G, B in [0, 255]; D in mm (0 = invalid) |
+| `observations/state` | (T, 13) | float32 | $S_t = [\hat v^H, \hat n^B, \hat\omega^B, \bar a_t]$ (Eq. 2) |
+| `observations/goal` | (T, 4) | float32 | $g_t$ (Eq. 3) |
+| `actions` | (T, 16, 4) | float32 | expert chunk $A_t$ in $\mathcal H_t$, m/s and rad/s (Eq. 4) |
+| `primitives` | (T,) | int64 | rule label $u^*_t$ (Sec. 3.3) |
+| `timestamps` | (T,) | float64 | capture time $\tau_t$ (s, simulation time) |
+| `future_targets` | (T,) | int64 | frame closest to $\tau_t + T_\nu$, −1 if none (Eq. 8 target) |
+
+Requirements on the VM: `gz-harmonic`, PX4-Autopilot `v1.17.0` built once with `make px4_sitl`,
+Micro-XRCE-DDS-Agent 2.4, ROS 2 Humble with `ros-humble-ros-gzharmonic` (the unofficial Humble/Harmonic
+pairing), `px4_msgs` (branch `release/1.17`) built in the workspace given by `--ros-ws`, and NumPy and h5py for
+the system Python that runs the collector (`sudo apt install python3-h5py`). The collector does not need
+PyTorch. PX4 is started with `UXRCE_DDS_SYNCT=0` (its stamps stay in simulation time), no RC or GCS failsafes,
+and DDS restricted to the loopback interface (`ROS_LOCALHOST_ONLY=1`, `UXRCE_DDS_PTCFG=1`).
+
 ## Repository layout
 
 | File | Paper | Contents |
@@ -137,18 +200,28 @@ metric range $d_t$ `[B]` of Eq. 27, or a callable that receives the predicted ch
 | `selector.py` | Secs. 3.1, 3.3, Eqs. 3, 12-14 | `PrimitiveSelector`, `primitive_labels`, `goal_feature`, `WaypointTracker` |
 | `solver.py` | Secs. 3.4-3.6, Eqs. 15-28 | `ConditionalVectorField`, `CFMSolver`, `NoisePersistence`, `SafetyFilter` |
 | `pipeline.py` | Sec. 3.7, Algorithm 1 | `VPAInferencePipeline`: `calibrate`, `reset`, `step`, `tick`, `act` |
+| `dataset.py` | Secs. 3.2, 3.4, 3.8 | `AeroVPADataset` (stages (i) and (ii)), `make_dataloader`, `text_conditioning` |
+| `inspect_hdf5.py` | Secs. 3.1-3.4 | prints a demonstration file and validates it against `VPAConfig` |
+| `sim/expert.py` | Secs. 3.1, 3.3, 5.1 | privileged expert (A*, minimum snap), labels, HDF5 schema, dry run |
+| `sim/collect_expert_dataset.py` | Secs. 4.3, 5.1 | ROS 2 collector: offboard flights, RGB-D/odometry pairing, HDF5 |
+| `sim/run_headless_sitl.sh` | Secs. 4.3, 5.1 | headless gz + PX4 SITL + uXRCE-DDS + ros_gz_bridge, with clean shutdown |
+| `sim/make_world.py`, `sim/models/` | Sec. 5.1 | E1 forest worlds with privileged maps; the `x500_vpa` RGB-D vehicle |
 | `docs/` | | the preprint PDF (CC BY 4.0, see [`docs/README.md`](docs/README.md)) |
 | `scripts/` | | `check_release.py` (release hygiene), `release.sh` (tag and publish) |
 | `.github/workflows/` | | CI: release checks, lint and self-tests on Python 3.10 and 3.13 (CPU) |
 
 ## Verification
 
-The six self-tests pass on Linux x86_64 with Python 3.10.20 and 3.13.17 and PyTorch 2.14.1 (CPU), and the code passes
+The six model self-tests pass on Linux x86_64 with Python 3.10.20 and 3.13.17 and PyTorch 2.14.1 (CPU), and the code passes
 `ruff check --select F,E9,B,PLE,PLW`. Every float64 reference comparison meets rtol = 1e-5, atol = 1e-6 except
 the sinusoidal flow-time embedding (4.1e-5 absolute: its arguments reach 1000 rad, where float32 argument rounding
 alone is ~3e-5). Comparisons of the full Table 1 networks are coded with rtol = 1e-4, atol = 1e-5 to leave margin
 for other BLAS back ends. The `pipeline.py` suite was mutation-tested: ten deliberately planted defects are each
-caught.
+caught. `sim/expert.py` and `dataset.py` were verified with Python 3.11, PyTorch 2.8 (CPU) and h5py 3.16.
+`sim/run_headless_sitl.sh` and `sim/collect_expert_dataset.py` were run end to end (start-up, offboard arming,
+two chained episodes, landing, shutdown, camera loss and Ctrl-C) against stand-ins for PX4, Gazebo and the
+bridge that speak the real `px4_msgs` (`release/1.17`) and `sensor_msgs` interfaces; the first run against
+Gazebo and PX4 is the Phase 1 pilot.
 
 ## License
 

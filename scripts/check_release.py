@@ -5,7 +5,7 @@
 Run from anywhere::
 
     python scripts/check_release.py              # static checks only (no third-party imports)
-    python scripts/check_release.py --run-tests  # + ruff and the six self-tests, in dependency order
+    python scripts/check_release.py --run-tests  # + ruff and the self-tests, in dependency order
 
 Checks
 ------
@@ -52,7 +52,8 @@ COMMERCIAL_NOTICE = (
 GPL3_SHA256 = "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
 GPL3_LINES = 674
 
-SELF_TESTS = ("config.py", "perception.py", "predictor.py", "selector.py", "solver.py", "pipeline.py")
+SELF_TESTS = ("config.py", "perception.py", "predictor.py", "selector.py", "solver.py", "pipeline.py",
+              "sim/expert.py", "dataset.py")
 LINT_COMMAND = ("ruff", "check", "--select", "F,E9,B,PLE,PLW", ".")
 EXPECTED_FILES = (
     *SELF_TESTS,
@@ -68,6 +69,14 @@ EXPECTED_FILES = (
     "scripts/check_release.py",
     "scripts/release.sh",
     ".github/workflows/selftest.yml",
+    "inspect_hdf5.py",
+    "sim/collect_expert_dataset.py",
+    "sim/make_world.py",
+    "sim/run_headless_sitl.sh",
+    "sim/models/aero_vpa_rgbd/model.config",
+    "sim/models/aero_vpa_rgbd/model.sdf",
+    "sim/models/x500_vpa/model.config",
+    "sim/models/x500_vpa/model.sdf",
 )
 PREPRINT_PDF = "docs/preprint_261026.pdf"
 
@@ -80,7 +89,7 @@ FORBIDDEN_PATTERNS = (
 MAX_FILE_BYTES = 5 * 1024 * 1024                      # the preprint PDF is ~0.4 MB
 BUILD_MACHINE_PATHS = re.compile(rb"/home/claude|/mnt/user-data|/tmp/claude-|/root/\.")
 SECRET_PATTERNS = re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}")
-TEXT_SUFFIXES = {".py", ".md", ".txt", ".cff", ".yml", ".yaml", ".sh", ".toml", ".cfg", ""}
+TEXT_SUFFIXES = {".py", ".md", ".txt", ".cff", ".yml", ".yaml", ".sh", ".toml", ".cfg", ".sdf", ".config", ""}
 
 
 class Report:
@@ -206,7 +215,7 @@ def check_readme(report: Report) -> None:
     for badge in ("GPL--3.0--only", "zenodo." + DOI.split("zenodo.")[1], "Python-3.10", "PyTorch-2.14", "ROS%202",
                   "Jetson%20Orin%20Nano"):
         report.check(badge in text, f"badge {badge!r}")
-    report.check(all(f"python {name}" in text for name in SELF_TESTS), "quick start lists the six self-tests")
+    report.check(all(f"python {name}" in text for name in SELF_TESTS), f"quick start lists the {len(SELF_TESTS)} self-tests")
 
 
 def check_citation(report: Report) -> None:
@@ -280,7 +289,7 @@ def run_tests(report: Report) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--run-tests", action="store_true", help="also run ruff and the six self-tests")
+    parser.add_argument("--run-tests", action="store_true", help="also run ruff and the self-tests")
     args = parser.parse_args(argv)
 
     print(f"Aero-VPA release check: {ROOT}")

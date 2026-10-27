@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SPDX-License-Identifier: GPL-3.0-only
+  Copyright (C) 2026 SLING AI Inc.
+
+  Aero-VPA RGB-D camera (preprint_261026.pdf, Sec. 5.1: "gz_x500_depth augmented with an aligned RGB stream").
+
+  The stock OakD-Lite of gz_x500_depth carries two unaligned sensors: a 1920 x 1080 RGB camera
+  (HFOV 1.204 rad) and a 640 x 480 depth camera (HFOV 1.274 rad), both at 30 Hz. This model keeps the
+  OakD-Lite body, mesh, mass and sensor pose and replaces the two sensors with one rgbd_camera that
+  renders colour and depth from the same viewpoint and intrinsics, directly at the network resolution
+  (160 x 128, Sec. 3.1) and at the knot rate 1/Delta = 50 Hz.
+
+  Topics (gz-transport): /aero_vpa/rgbd/{image, depth_image, camera_info, points}.
+  Depth is z-depth in metres (32FC1); +inf beyond 19.1 m and -inf below 0.2 m (the OakD-Lite depth range).
+-->
+<sdf version="1.9">
+  <model name="aero_vpa_rgbd">
+    <pose>0 0 0 0 0 0</pose>
+    <self_collide>false</self_collide>
+    <static>false</static>
+    <link name="camera_link">
+      <inertial>
+        <pose>0.00358 -0.03 .014 0 0 0</pose>
+        <mass>0.061</mass>
+        <inertia>
+          <ixx>0.0000460804</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.0000055421</iyy>
+          <iyz>0</iyz>
+          <izz>0.0000436519</izz>
+        </inertia>
+      </inertial>
+      <visual name="aero_vpa_rgbd/visual">
+        <pose>0 0 0 0 0 0</pose>
+        <geometry>
+          <mesh>
+            <scale>1 1 1</scale>
+            <uri>model://OakD-Lite/meshes/OakDLite.dae</uri>
+          </mesh>
+        </geometry>
+      </visual>
+      <collision name="aero_vpa_rgbd/collision">
+        <pose>0.00358 -0.03 .014 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.0175 0.091 0.028</size>
+          </box>
+        </geometry>
+      </collision>
+      <sensor name="aero_vpa_rgbd" type="rgbd_camera">
+        <gz_frame_id>camera_link</gz_frame_id>
+        <pose>0.01233 -0.03 .01878 0 0 0</pose>
+        <topic>/aero_vpa/rgbd</topic>
+        <always_on>1</always_on>
+        <update_rate>50</update_rate>
+        <visualize>false</visualize>
+        <camera>
+          <horizontal_fov>1.274</horizontal_fov>
+          <image>
+            <width>160</width>
+            <height>128</height>
+            <format>R8G8B8</format>
+          </image>
+          <clip>
+            <near>0.1</near>
+            <far>100</far>
+          </clip>
+          <depth_camera>
+            <clip>
+              <near>0.2</near>
+              <far>19.1</far>
+            </clip>
+          </depth_camera>
+        </camera>
+      </sensor>
+      <gravity>true</gravity>
+      <velocity_decay/>
+    </link>
+  </model>
+</sdf>
