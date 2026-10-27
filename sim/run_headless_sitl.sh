@@ -160,9 +160,9 @@ check_alive() {  # check_alive NAME LOGFILE: fail fast with the log tail if a st
 wait_for() {  # wait_for DESCRIPTION TIMEOUT NAME LOGFILE COMMAND...: poll COMMAND every second
     local what="$1" timeout="$2" name="$3" logfile="$4"
     shift 4
-    local t
-    for (( t=0; t<timeout; t++ )); do
-        if "$@" >/dev/null 2>&1; then log "$what: ok (${t} s)"; return 0; fi
+    local start=$SECONDS
+    while (( SECONDS - start < timeout )); do              # wall time: a probe may itself take seconds
+        if "$@" >/dev/null 2>&1; then log "$what: ok ($(( SECONDS - start )) s)"; return 0; fi
         check_alive "$name" "$logfile"
         sleep 1
     done
@@ -361,8 +361,11 @@ if [[ $BRIDGE -eq 1 ]]; then
         --ros-args -r "/world/$WORLD_NAME/clock:=/clock"
     wait_for "PX4 topics in ROS 2 (domain $ROS_DOMAIN_ID)" "$START_TIMEOUT" agent "$RUN_DIR/agent.log" \
         bash -c "ros2 topic list --no-daemon | grep -qx /fmu/out/vehicle_odometry"
-    wait_for "camera topics in ROS 2" "$START_TIMEOUT" bridge "$RUN_DIR/bridge.log" \
-        bash -c "ros2 topic list --no-daemon | grep -qx '$DEPTH_TOPIC'"
+    # Frames, not just topics: a bridge can advertise both image topics and still deliver nothing
+    # (the collector then stops with "no data after 60 s on: synchronised ... image + depth_image").
+    wait_for "RGB and depth frames in ROS 2" "$START_TIMEOUT" bridge "$RUN_DIR/bridge.log" \
+        bash -c "timeout 10 ros2 topic echo --once '$DEPTH_TOPIC' sensor_msgs/msg/Image >/dev/null &&
+                 timeout 10 ros2 topic echo --once '$RGB_TOPIC' sensor_msgs/msg/Image >/dev/null"
     wait_for "simulation clock in ROS 2" "$START_TIMEOUT" bridge "$RUN_DIR/bridge.log" \
         timeout 10 ros2 topic echo --once /clock rosgraph_msgs/msg/Clock
 fi

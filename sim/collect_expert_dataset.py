@@ -29,10 +29,14 @@ capture time, so every sample is consistent at tau_t.
 Flight sequence: wait for PX4 and the sensors, stream setpoints, switch to offboard and arm, take off, and
 then for each episode: sample a mission (3-6 waypoints, 10-40 m apart), plan it on the privileged map in a
 worker process (hovering meanwhile), turn to the initial heading, fly it while recording, hover. Episodes
-are chained in the air; after the last one, or after a failed one, the vehicle lands. HDF5 is written by
+are chained in the air; after the last one, or after a failed one, the vehicle lands and re-arms. A
+collision ends the run instead (exit status 3): the vehicle may be tipped over or caught in a tree, and PX4
+then never passes its pre-flight checks again, so the simulator has to be restarted. Episodes recorded
+before it stay in the file; ``--append`` continues it (sim/collect_worlds.sh does this). HDF5 is written by
 a separate process so that compression never delays the 100 Hz setpoint stream.
 
-Exit status: 0 when every requested episode succeeded, 1 on errors, 2 when too many episodes failed.
+Exit status: 0 when every requested episode succeeded, 1 on errors, 2 when too many episodes failed in a
+row, 3 after a collision (restart the simulator and append).
 """
 
 from __future__ import annotations
@@ -77,6 +81,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--takeoff_altitude", type=float, default=2.5)
     p.add_argument("--instruction", default="", help="optional instruction x stored with every episode")
     p.add_argument("--max_failures", type=int, default=5, help="consecutive failed episodes before giving up")
+    p.add_argument("--rearm_timeout", type=float, default=30.0,
+                   help="simulation seconds to wait for PX4's pre-flight checks before arming")
     p.add_argument("--keep_failed", action="store_true", help="keep failed episodes (success=False) in the file")
     p.add_argument("--compression", choices=["gzip", "lzf", "none"], default="gzip")
     p.add_argument("--dry_run", action="store_true", help="no ROS/Gazebo: kinematic model and ray-cast camera")
@@ -566,6 +572,9 @@ def run_ros(args: argparse.Namespace) -> int:
             if self.phase == "WAIT":
                 if not armed and st.pre_flight_checks_pass and elapsed > 1.5:
                     self.set_phase("ARM")
+                elif elapsed > self.args.rearm_timeout:
+                    raise RuntimeError(f"PX4 pre-flight checks did not pass within {self.args.rearm_timeout:.0f} s "
+                                       f"({'armed' if armed else 'disarmed'}); restart the simulator")
             elif self.phase == "ARM":
                 if armed and offboard:
                     target = pos + np.array([0.0, 0.0, -self.args.takeoff_altitude])
@@ -669,6 +678,11 @@ def run_ros(args: argparse.Namespace) -> int:
             yaw = E.yaw_from_quat(self.odom.latest()[3])
             if reason is not None:
                 self.end_episode(False, reason)
+                if reason == "collision":     # the vehicle may be damaged in the simulation: end the run here
+                    self.get_logger().error("collision: ending the run; restart the simulator and use --append")
+                    self.set_phase("DONE")
+                    self.exit_code = 3
+                    return
                 self._hover(now, pos, yaw)
                 self.set_phase("LAND")
                 return

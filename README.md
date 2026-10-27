@@ -155,14 +155,14 @@ sim/run_headless_sitl.sh --px4-dir ~/PX4-Autopilot --ros-ws ~/px4_ros_ws -- \
     python3 sim/collect_expert_dataset.py --num_episodes 2 --output pilot_sample.hdf5
 python inspect_hdf5.py pilot_sample.hdf5                   # exit status 1 on any schema violation
 
-# 3. scale-up: 200 worlds x 10 flights = 2,000 demonstrations (Sec. 5.1); one stack per world,
-#    --instance N runs several stacks side by side (own DDS port, ROS domain and gz partition)
+# 3. scale-up: 200 worlds x 10 flights = 2,000 demonstrations (Sec. 5.1). collect_worlds.sh starts one stack
+#    per world and resumes: a run that ends early (a collision needs a fresh simulator, exit status 3) is
+#    restarted with --append and a new mission seed, and complete worlds are skipped, so it can be rerun at
+#    any time. --instance N runs several sweeps side by side (own DDS port, ROS domain and gz partition);
+#    about one stack per 4 vCPUs.
 python sim/make_world.py --seed 0 --count 200 --density sparse   # sim/worlds/*.sdf + privileged *.json
-for i in $(seq 0 199); do
-  w=$(printf aero_forest_sparse_s%04d "$i")
-  sim/run_headless_sitl.sh --px4-dir ~/PX4-Autopilot --ros-ws ~/px4_ros_ws --world "sim/worlds/$w.sdf" -- \
-      python3 sim/collect_expert_dataset.py --num_episodes 10 --seed "$i" --output "data/$w.hdf5"
-done
+sim/collect_worlds.sh --instance 0 sim/worlds/aero_forest_sparse_s00{00..99}.sdf -- --compression lzf
+sim/collect_worlds.sh --instance 1 sim/worlds/aero_forest_sparse_s01{00..99}.sdf -- --compression lzf
 python inspect_hdf5.py --quiet data/*.hdf5
 ```
 
@@ -242,6 +242,7 @@ python calibrate_sigma.py checkpoints/policy.pt "data_val/*.hdf5"
 | `calibrate_sigma.py` | Sec. 3.5, Eq. 23 | sigma_lo and sigma_crit from validation flights, written into the checkpoint |
 | `sim/expert.py` | Secs. 3.1, 3.3, 5.1 | privileged expert (A*, minimum snap), labels, HDF5 schema, dry run |
 | `sim/collect_expert_dataset.py` | Secs. 4.3, 5.1 | ROS 2 collector: offboard flights, RGB-D/odometry pairing, HDF5 |
+| `sim/collect_worlds.sh` | Sec. 5.1 | resumable sweep over many worlds: restarts, appends, skips complete worlds |
 | `sim/run_headless_sitl.sh` | Secs. 4.3, 5.1 | headless gz + PX4 SITL + uXRCE-DDS + ros_gz_bridge, with clean shutdown |
 | `sim/make_world.py`, `sim/models/` | Sec. 5.1 | E1 forest worlds with privileged maps; the `x500_vpa` RGB-D vehicle |
 | `docs/` | | the preprint PDF (CC BY 4.0, see [`docs/README.md`](docs/README.md)) |

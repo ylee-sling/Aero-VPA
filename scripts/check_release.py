@@ -73,6 +73,7 @@ EXPECTED_FILES = (
     ".github/workflows/selftest.yml",
     "inspect_hdf5.py",
     "sim/collect_expert_dataset.py",
+    "sim/collect_worlds.sh",
     "sim/make_world.py",
     "sim/run_headless_sitl.sh",
     "sim/models/aero_vpa_rgbd/model.config",
