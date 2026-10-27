@@ -52,11 +52,13 @@ COMMERCIAL_NOTICE = (
 GPL3_SHA256 = "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
 GPL3_LINES = 674
 
+# Self-test commands in dependency order (a script with options runs as "python <file> <options>").
 SELF_TESTS = ("config.py", "perception.py", "predictor.py", "selector.py", "solver.py", "pipeline.py",
-              "sim/expert.py", "dataset.py")
+              "checkpoint.py", "sim/expert.py", "dataset.py", "train_stage1.py --self-test",
+              "cache_latents.py --self-test", "train_stage2.py --self-test", "calibrate_sigma.py --self-test")
 LINT_COMMAND = ("ruff", "check", "--select", "F,E9,B,PLE,PLW", ".")
 EXPECTED_FILES = (
-    *SELF_TESTS,
+    *(command.split()[0] for command in SELF_TESTS),
     "LICENSE",
     "README.md",
     "CITATION.cff",
@@ -277,7 +279,7 @@ def run_tests(report: Report) -> None:
     for name in SELF_TESTS:
         start = time.perf_counter()
         proc = subprocess.run(
-            [sys.executable, name], cwd=ROOT, capture_output=True, text=True, env=env, check=False
+            [sys.executable, *name.split()], cwd=ROOT, capture_output=True, text=True, env=env, check=False
         )
         seconds = time.perf_counter() - start
         tail = (proc.stdout + proc.stderr).strip().splitlines()[-25:]

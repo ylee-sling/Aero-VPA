@@ -26,6 +26,12 @@ logs/
 *.hdf5
 *.h5
 sim/worlds/
+
+# Training outputs (checkpoints, latent caches, training logs)
+checkpoints/
+latents/
+*.log.jsonl
+*.state.pt
 wandb/
 checkpoints/
 

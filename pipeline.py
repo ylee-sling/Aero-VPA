@@ -238,6 +238,63 @@ class VPAInferencePipeline(nn.Module):
             execution_mode=execution_mode,
         )
 
+    @classmethod
+    def from_checkpoint(
+        cls,
+        path: str,
+        *,
+        latency_bound: float,
+        tracking_lag: float,
+        text_encoder: Union[str, TextEncoderWrapper] = "auto",
+        execution_mode: str = "async",
+        map_location: Any = "cpu",
+        **config_overrides: Any,
+    ) -> "VPAInferencePipeline":
+        """Rebuild the closed loop from a "policy" checkpoint (checkpoint.py), calibrated and frozen.
+
+        Args:
+            path: checkpoint written by train_stage2.py (and calibrate_sigma.py for sigma_lo, sigma_crit).
+            latency_bound, tracking_lag, execution_mode: as in ``from_config``.
+            text_encoder: "clip" (the frozen CLIP tower of the config), "null" (no text tower: missions without
+                instructions only), "auto" ("null" if the training data had no instructions, else "clip"), or an
+                injected ``TextEncoderWrapper``. The learned null embedding is loaded into it in every case.
+            map_location: device for loading.
+            **config_overrides: ``VPAConfig`` fields to override, e.g. sigma_lo and sigma_crit before calibration.
+        """
+        try:
+            from .checkpoint import config_from_dict, load_checkpoint, null_text_encoder
+        except ImportError:
+            from checkpoint import config_from_dict, load_checkpoint, null_text_encoder
+        ckpt = load_checkpoint(path, kind="policy", map_location=map_location)
+        config = config_from_dict(ckpt["config"], **config_overrides)
+        if config.sigma_lo is None or config.sigma_crit is None:
+            raise ValueError(f"{path} has no calibrated sigma_lo / sigma_crit: run calibrate_sigma.py, or pass "
+                             "sigma_lo=... and sigma_crit=... to from_checkpoint")
+        if isinstance(text_encoder, str):
+            choice = text_encoder
+            if choice == "auto":
+                choice = "clip" if ckpt["provenance"].get("instructions") else "null"
+            if choice == "null":
+                text_encoder = null_text_encoder(config.text_dim)
+            elif choice == "clip":
+                text_encoder = TextEncoderWrapper(config.clip_model_name)
+            else:
+                raise ValueError("text_encoder must be 'auto', 'null', 'clip' or a TextEncoderWrapper")
+        pipe = cls.from_config(config, text_encoder, latency_bound=latency_bound, tracking_lag=tracking_lag,
+                               execution_mode=execution_mode)
+        states = ckpt["state_dict"]
+        pipe.vision_encoder.load_state_dict(states["vision_encoder"])
+        pipe.predictor.load_state_dict(states["predictor"])
+        pipe.selector.load_state_dict(states["selector"])
+        pipe.solver.load_state_dict(states["solver"])
+        with torch.no_grad():
+            pipe.text_encoder.null_embedding.copy_(states["text_null_embedding"])
+        cal = ckpt["calibration"]
+        pipe.to(map_location if isinstance(map_location, (str, torch.device)) else "cpu")
+        pipe.calibrate(float(cal["gamma_bar_star"]), cal["latent_mean"], cal["proprio_mean"], cal["proprio_std"])
+        pipe.text_encoder.requires_grad_(False)
+        return pipe
+
     def _validate_dimensions(self) -> None:
         d, d_c = self.vision_encoder.latent_dim, self.text_encoder.embed_dim
         checks = [

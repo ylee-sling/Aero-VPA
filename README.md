@@ -50,7 +50,9 @@ time needed to stream billions of weights. Aero-VPA removes the decoder from the
 This repository contains the model and the closed-loop runtime in PyTorch: all networks of Table 1, the training
 objectives, the safety layer and Algorithm 1 (decision loop and 100 Hz executor), with offline self-tests.
 `sim/` adds the Phase 1 data pipeline: a headless Gazebo Harmonic + PX4 SITL stack, the privileged expert of
-Section 5.1, and an HDF5 writer whose files `dataset.py` loads for training stages (i) and (ii).
+Section 5.1, and an HDF5 writer whose files `dataset.py` loads. The training scripts run stages (i) and (ii) of
+Section 3.8 on those files, calibrate the uncertainty thresholds of Section 3.5, and write one checkpoint that
+`VPAInferencePipeline.from_checkpoint` loads.
 The preprint specifies its benchmark protocol before execution and reports **no experimental results**; this
 release likewise ships **no trained weights, no demonstrations and no flight results**. ROS 2 control nodes,
 TensorRT engines and the HITL harness of Sections 4-5 are deployment targets of the paper and are not part of
@@ -105,24 +107,26 @@ python predictor.py
 python selector.py
 python solver.py
 python pipeline.py
+python checkpoint.py
 python sim/expert.py       # expert planner, labels and HDF5 schema (cross-checked against selector.py)
 python dataset.py          # dry-run file -> inspect_hdf5 -> stage (i) and (ii) training steps
+python train_stage1.py --self-test
+python cache_latents.py --self-test
+python train_stage2.py --self-test
+python calibrate_sigma.py --self-test   # the whole chain on dry-run data, checked against the closed loop
 
 # the release checks: headers, licence files, citation metadata, lint and all self-tests
 python scripts/check_release.py --run-tests
 ```
 
-Closed-loop use, after training stage (i) and (ii) and calibrating the uncertainty thresholds on validation
-flights (Sec. 3.5):
+Closed-loop use, after training stages (i) and (ii) and calibrating the uncertainty thresholds on validation
+flights (Sec. 3.5; see Phase 2 below):
 
 ```python
-from config import VPAConfig
 from pipeline import Observation, VPAInferencePipeline
 
-cfg = VPAConfig(sigma_lo=0.2, sigma_crit=0.6)                 # calibrated quantiles of sigma_bar
-pipe = VPAInferencePipeline.from_config(cfg, latency_bound=0.05, tracking_lag=0.03)  # loads CLIP ViT-B/32
-pipe.calibrate(gamma_bar_star, latent_mean, proprio_mean, proprio_std)   # frozen statistics of stage (i)
-pipe.reset("inspect the second floor", waypoints)             # waypoints: [B, M, 3] in NED (m)
+pipe = VPAInferencePipeline.from_checkpoint("checkpoints/policy.pt", latency_bound=0.05, tracking_lag=0.03)
+pipe.reset(None, waypoints)                                   # instruction (None: none); waypoints [B, M, 3] NED (m)
 
 s_t = pipe.proprioception(velocity_ned, gravity_body, body_rates, yaw)   # S_t, Eq. 2
 out = pipe.act(now, Observation(image, s_t, position, yaw, clearance, capture_time))
@@ -190,6 +194,35 @@ the system Python that runs the collector (`sudo apt install python3-h5py`). The
 PyTorch. PX4 is started with `UXRCE_DDS_SYNCT=0` (its stamps stay in simulation time), no RC or GCS failsafes,
 and DDS restricted to the loopback interface (`ROS_LOCALHOST_ONLY=1`, `UXRCE_DDS_PTCFG=1`).
 
+## Phase 2: training (Sec. 3.8)
+
+Four commands turn the demonstration files into one checkpoint. Run them in the repository root on the GPU VM:
+
+```bash
+# (i) JEPA representation learning of E_psi and P_omega (Eq. 8); freezes gamma* and mu_Z (Eq. 11)
+python train_stage1.py "data/*.hdf5" --out checkpoints/stage1.pt --epochs 20
+# cache z_t, z_hat_{t+1} and sigma_{t+1} of the frozen networks for every frame
+python cache_latents.py checkpoints/stage1.pt "data/*.hdf5" --out_dir latents
+# (ii) primitive selector + CFM solver + null instruction embedding (Eq. 30)
+python train_stage2.py checkpoints/stage1.pt "data/*.hdf5" --latents latents --out checkpoints/policy.pt
+# sigma_lo / sigma_crit from validation flights (validation worlds, seeds disjoint from training)
+python calibrate_sigma.py checkpoints/policy.pt "data_val/*.hdf5"
+```
+
+* Each training script writes `<out>.log.jsonl` (training and validation records) and `<out>.state.pt`;
+  `--resume` continues an interrupted run. Validation uses held-out episodes (`--val_fraction`, hashed per
+  episode with the same `--split_seed` in both stages) or separate files (`--val`).
+* Stage (i) reports collapse diagnostics (per-dimension latent std, effective rank, ensemble disagreement) and the
+  prediction error relative to the "no change" baseline. Before a long run, check the throughput with
+  `--steps 300 --log_every 50`: the log prints samples/s and the fraction of time spent waiting for data
+  (raise `--num_workers` if it is high; `--compile` speeds up the encoder on recent GPUs).
+* Stage (ii) holds all frames in memory (about 2.4 KB per frame, on the GPU when it fits) and reports L_CFM,
+  L_CE, selector accuracy and recall per primitive, and the error of generated chunks against the expert in m/s.
+* The (1 - p_fa)-quantile behind sigma_crit needs many decisions: with p_fa = n_fa / (f_dec T_mis) = 1.7e-5 at
+  50 Hz, roughly 10^6 or more correlated decisions (hours of validation flight) give 10 expected exceedances.
+  `calibrate_sigma.py` reports the effective sample size and warns when sigma_crit is not resolved.
+* Dataset aggregation, stage (iii) of Sec. 3.8 (DAgger), needs a closed-loop policy node in SITL and is the next step.
+
 ## Repository layout
 
 | File | Paper | Contents |
@@ -199,9 +232,14 @@ and DDS restricted to the loopback interface (`ROS_LOCALHOST_ONLY=1`, `UXRCE_DDS
 | `predictor.py` | Secs. 3.2, 3.5, Eqs. 7-11, 22 | `JEPAPredictor`, `VICRegLoss`, `LatentScaleTracker` |
 | `selector.py` | Secs. 3.1, 3.3, Eqs. 3, 12-14 | `PrimitiveSelector`, `primitive_labels`, `goal_feature`, `WaypointTracker` |
 | `solver.py` | Secs. 3.4-3.6, Eqs. 15-28 | `ConditionalVectorField`, `CFMSolver`, `NoisePersistence`, `SafetyFilter` |
-| `pipeline.py` | Sec. 3.7, Algorithm 1 | `VPAInferencePipeline`: `calibrate`, `reset`, `step`, `tick`, `act` |
+| `pipeline.py` | Sec. 3.7, Algorithm 1 | `VPAInferencePipeline`: `from_checkpoint`, `calibrate`, `reset`, `step`, `tick`, `act` |
 | `dataset.py` | Secs. 3.2, 3.4, 3.8 | `AeroVPADataset` (stages (i) and (ii)), `make_dataloader`, `text_conditioning` |
 | `inspect_hdf5.py` | Secs. 3.1-3.4 | prints a demonstration file and validates it against `VPAConfig` |
+| `checkpoint.py` | Secs. 3.5, 3.8 | one-file checkpoints (config, networks, frozen statistics, provenance) |
+| `train_stage1.py` | Secs. 3.2, 3.8, Eqs. 8-11 | stage (i): E_psi and P_omega with VICReg, EMA target and gamma tracking |
+| `cache_latents.py` | Sec. 3.8 | z_t, z_hat_{t+1} and sigma_{t+1} of the frozen stage-(i) networks per frame |
+| `train_stage2.py` | Secs. 3.3, 3.4, 3.8, Eq. 30 | stage (ii): selector, CFM solver and null instruction embedding |
+| `calibrate_sigma.py` | Sec. 3.5, Eq. 23 | sigma_lo and sigma_crit from validation flights, written into the checkpoint |
 | `sim/expert.py` | Secs. 3.1, 3.3, 5.1 | privileged expert (A*, minimum snap), labels, HDF5 schema, dry run |
 | `sim/collect_expert_dataset.py` | Secs. 4.3, 5.1 | ROS 2 collector: offboard flights, RGB-D/odometry pairing, HDF5 |
 | `sim/run_headless_sitl.sh` | Secs. 4.3, 5.1 | headless gz + PX4 SITL + uXRCE-DDS + ros_gz_bridge, with clean shutdown |
@@ -220,8 +258,11 @@ for other BLAS back ends. The `pipeline.py` suite was mutation-tested: ten delib
 caught. `sim/expert.py` and `dataset.py` were verified with Python 3.11, PyTorch 2.8 (CPU) and h5py 3.16.
 `sim/run_headless_sitl.sh` and `sim/collect_expert_dataset.py` were run end to end (start-up, offboard arming,
 two chained episodes, landing, shutdown, camera loss and Ctrl-C) against stand-ins for PX4, Gazebo and the
-bridge that speak the real `px4_msgs` (`release/1.17`) and `sensor_msgs` interfaces; the first run against
-Gazebo and PX4 is the Phase 1 pilot.
+bridge that speak the real `px4_msgs` (`release/1.17`) and `sensor_msgs` interfaces, and then on the target VM
+(NVIDIA L4, PX4 v1.17.0, Gazebo Harmonic 8.15.0) for the Phase 1 pilot and collection. The training scripts
+and `checkpoint.py` were verified on CPU (Python 3.11, PyTorch 2.8): their self-tests run the whole chain on
+dry-run data, and the calibration test checks that the closed loop rebuilt with `from_checkpoint` reproduces the
+calibrated sigma_bar decision by decision. GPU throughput has not been measured yet.
 
 ## License
 
