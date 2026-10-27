@@ -315,8 +315,15 @@ export PX4_UXRCE_DDS_NS=""                    # topics stay /fmu/... for every i
 export PX4_PARAM_UXRCE_DDS_SYNCT=0            # message timestamps stay in PX4 (= Gazebo simulation) time
 export PX4_PARAM_COM_RC_IN_MODE=4             # no RC or joystick on a headless VM
 export PX4_PARAM_COM_RCL_EXCEPT=4             # no manual-control-loss failsafe in offboard
-export PX4_PARAM_NAV_DLL_ACT=0                # no GCS-loss failsafe
 start_bg px4 "$RUN_DIR/px4.log" "$PX4_BUILD/bin/px4" "${PX4_ARGS[@]}"
+wait_for "PX4 start-up script" "$START_TIMEOUT" px4 "$RUN_DIR/px4.log" \
+    grep -q "Startup script returned successfully" "$RUN_DIR/px4.log"
+# No GCS on a headless VM: NAV_DLL_ACT must be 0, or PX4 refuses to arm ("No connection to the GCS").
+# It cannot go through PX4_PARAM_*: 0 is its compiled default, so it is not stored as changed and the
+# airframe's "param set-default NAV_DLL_ACT 2" (4001_gz_x500) replaces it. Commander reads it live.
+"$PX4_BUILD/bin/px4-param" --instance "$INSTANCE" set NAV_DLL_ACT 0 >"$RUN_DIR/px4-param.log" 2>&1 \
+    || die "could not set NAV_DLL_ACT on the running PX4 (see $RUN_DIR/px4-param.log)"
+log "PX4 parameter NAV_DLL_ACT set to 0 (no ground station required)"
 wait_for "PX4 ready for takeoff" "$START_TIMEOUT" px4 "$RUN_DIR/px4.log" \
     grep -q "Ready for takeoff" "$RUN_DIR/px4.log"
 if grep -q "ERROR \[init\]" "$RUN_DIR/px4.log"; then
