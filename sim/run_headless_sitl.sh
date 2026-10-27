@@ -350,15 +350,21 @@ wait_for "first depth frame on $DEPTH_TOPIC" "$START_TIMEOUT" gz "$RUN_DIR/gz.lo
 
 # ---------------------------------------------------------------------------------- 5. ROS 2 bridge
 if [[ $BRIDGE -eq 1 ]]; then
+    # The world's own clock, remapped to /clock. gz adds the root /clock topic only if it sees no other
+    # publisher of /clock at start-up, and a server of the same instance stopped seconds earlier can still
+    # look like one; the run then never gets /clock ("no data after 60 s on: /clock").
     start_bg bridge "$RUN_DIR/bridge.log" ros2 run ros_gz_bridge parameter_bridge \
-        "/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock" \
+        "/world/$WORLD_NAME/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock" \
         "$RGB_TOPIC@sensor_msgs/msg/Image[gz.msgs.Image" \
         "$DEPTH_TOPIC@sensor_msgs/msg/Image[gz.msgs.Image" \
-        "$INFO_TOPIC@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo"
+        "$INFO_TOPIC@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo" \
+        --ros-args -r "/world/$WORLD_NAME/clock:=/clock"
     wait_for "PX4 topics in ROS 2 (domain $ROS_DOMAIN_ID)" "$START_TIMEOUT" agent "$RUN_DIR/agent.log" \
         bash -c "ros2 topic list --no-daemon | grep -qx /fmu/out/vehicle_odometry"
     wait_for "camera topics in ROS 2" "$START_TIMEOUT" bridge "$RUN_DIR/bridge.log" \
         bash -c "ros2 topic list --no-daemon | grep -qx '$DEPTH_TOPIC'"
+    wait_for "simulation clock in ROS 2" "$START_TIMEOUT" bridge "$RUN_DIR/bridge.log" \
+        timeout 10 ros2 topic echo --once /clock rosgraph_msgs/msg/Clock
 fi
 export AERO_VPA_RGB_TOPIC="$RGB_TOPIC" AERO_VPA_DEPTH_TOPIC="$DEPTH_TOPIC"
 
