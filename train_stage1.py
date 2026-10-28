@@ -22,8 +22,10 @@ Outputs next to ``--out``: the checkpoint, ``<out>.state.pt`` (optimiser, EMA ta
 
 Validation (held-out episodes: --val files, or a hash split of the training files with --val_fraction)
 reports the three loss terms and collapse diagnostics: per-dimension latent std, the effective rank of Z,
-the ensemble disagreement sigma (Eq. 22), and the ratio of the prediction error to the "no change" baseline
-||E_psi_bar(I_t) - E_psi_bar(I_{t+1})||^2 (below 1: the predictor forecasts more than persistence).
+the ensemble disagreement sigma (Eq. 22), and the prediction error against "no change": the ratio to
+||E_psi(I_t) - E_psi_bar(I_{t+1})||^2 (copying the predictor's own input z_t; below 1: the predictor forecasts
+more than persistence), persistence in the target space ||E_psi_bar(I_t) - E_psi_bar(I_{t+1})||^2, and the EMA
+gap ||E_psi(I_t) - E_psi_bar(I_t)||^2 that separates the two. diagnose_stage1.py breaks the error down further.
 
 Choices the paper leaves open, as defaults here: AdamW (betas 0.9/0.95, weight decay 0.05 except biases,
 norms, embeddings and position/[CLS] tokens), learning rate 3e-4 for batch 256 with linear warm-up and a
@@ -188,7 +190,7 @@ def evaluate_stage1(encoder: nn.Module, target: nn.Module, predictor: nn.Module,
     was_training = encoder.training, predictor.training
     encoder.eval()
     predictor.eval()
-    sums: Dict[str, float] = {"inv": 0.0, "var": 0.0, "cov": 0.0, "copy": 0.0}
+    sums: Dict[str, float] = {"inv": 0.0, "var": 0.0, "cov": 0.0, "copy": 0.0, "copy_online": 0.0, "gap": 0.0}
     n_batches, zs, sigmas = 0, [], []
     for batch in loader:
         img = _batch_images(batch, "", normalizer, device)
@@ -205,7 +207,9 @@ def evaluate_stage1(encoder: nn.Module, target: nn.Module, predictor: nn.Module,
             sums["var"] += float(loss_fn.variance(z))
             sums["cov"] += float(loss_fn.covariance(z))
         sums["inv"] += float(loss_fn.invariance(heads, z_next))
-        sums["copy"] += float((z_now - z_next).pow(2).sum(dim=-1).mean())
+        sums["copy"] += float((z_now - z_next).pow(2).sum(dim=-1).mean())          # persistence, target space
+        sums["copy_online"] += float((z - z_next).pow(2).sum(dim=-1).mean())       # persistence of the input z_t
+        sums["gap"] += float((z - z_now).pow(2).sum(dim=-1).mean())                # EMA lag of the target
         zs.append(z.cpu())
         sigmas.append(_ensemble_sigma(heads, gamma).cpu())
         n_batches += 1
@@ -216,6 +220,7 @@ def evaluate_stage1(encoder: nn.Module, target: nn.Module, predictor: nn.Module,
     out = {k: v / n_batches for k, v in sums.items()}
     out["total"] = out["inv"] + loss_fn.lambda_v * out["var"] + loss_fn.lambda_c * out["cov"]
     out["inv_over_copy"] = out["inv"] / max(out["copy"], 1e-12)
+    out["inv_over_copy_online"] = out["inv"] / max(out["copy_online"], 1e-12)
     z_all = torch.cat(zs)[:4096]
     std = z_all.std(dim=0) if z_all.shape[0] >= 2 else torch.zeros(z_all.shape[1])
     sigma = torch.cat(sigmas)
@@ -341,7 +346,8 @@ def train_stage1(args: argparse.Namespace) -> str:
             if val_loader is not None and (step % args.val_every == 0 or step == total):
                 metrics = evaluate_stage1(encoder, target, predictor, loss_fn, normalizer, val_loader, gamma, device, amp)
                 log("val", f"val @ {step}: total {metrics['total']:.3f} inv {metrics['inv']:.3f} "
-                    f"(no-change baseline {metrics['copy']:.3f}, ratio {metrics['inv_over_copy']:.3f})  "
+                    f"(no change: from z_t {metrics['copy_online']:.3f}, ratio {metrics['inv_over_copy_online']:.3f}; "
+                    f"in target space {metrics['copy']:.3f}; EMA gap {metrics['gap']:.3f})  "
                     f"latent std mean {metrics['latent_std_mean']:.3f} min {metrics['latent_std_min']:.3f}  "
                     f"eff. rank {metrics['effective_rank']:.1f}/{cfg.latent_dim}  sigma mean {metrics['sigma_mean']:.4f}",
                     step=step, **metrics)

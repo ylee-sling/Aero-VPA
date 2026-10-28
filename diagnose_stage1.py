@@ -3,22 +3,25 @@
 """
 diagnose_stage1.py -- Where does the stage-(i) prediction error come from? (preprint_261026.pdf, Eq. 8)
 
-The training log compares the predictor with the "no change" baseline ||E_bar(I_t) - E_bar(I_t+1)||^2, which
-lives entirely in the space of the EMA target encoder E_bar. The predictor, however, reads the online latent
-z_t = E(I_t) and has to land in the target space, so its error also contains the lag between E and E_bar.
-This tool separates the two. It reads a training state (``<out>.state.pt``, written every --save_minutes
-while train_stage1.py runs, so it works during training) and reports on held-out and training frames:
+The predictor P_omega reads the online latent z_t = E(I_t) and is trained towards the EMA target E_bar(I_t+1),
+so its error contains two things: what it fails to forecast about the next 0.1 s, and the lag between E and
+E_bar. A "no change" baseline computed entirely in the target space, ||E_bar(I_t) - E_bar(I_t+1)||^2, contains
+only the first. This tool separates them. It reads a training state (``<out>.state.pt``, written every
+--save_minutes while train_stage1.py runs, so it also works during training) and reports on held-out and
+training frames:
 
-    no change, target space    ||E_bar(I_t) - E_bar(I_t+1)||^2      the baseline of the training log
-    no change, online input    ||E(I_t)     - E_bar(I_t+1)||^2      what copying z_t achieves
-    online/target gap          ||E(I_t)     - E_bar(I_t)  ||^2      lag of the EMA target encoder
-    change in online space     ||E(I_t)     - E(I_t+1)    ||^2
-    predictor, Eq. 8 term      (1/N_e) sum_i ||P^(i)(z_t, u_t, a_bar_t) - E_bar(I_t+1)||^2   (the logged "inv")
-    predictor, ensemble mean   ||z_hat_t+1 - E_bar(I_t+1)||^2
-    predictor fed E_bar(I_t)   the same with the target latent of I_t as input
-    linear map from E(I_t)     ridge regression [z_t, onehot(u_t), a_bar_t] -> E_bar(I_t+1), fitted on training frames
-    linear map from E_bar(I_t) the same from the target latent
-    cos(predicted, true change) mean cosine between z_hat - E_bar(I_t) and E_bar(I_t+1) - E_bar(I_t)
+    no change, target space     ||E_bar(I_t) - E_bar(I_t+1)||^2     persistence in the target space
+    no change, online input     ||E(I_t)     - E_bar(I_t+1)||^2     what copying z_t achieves
+    online/target gap           ||E(I_t)     - E_bar(I_t)  ||^2     lag of the EMA target encoder
+    change in online space      ||E(I_t)     - E(I_t+1)    ||^2
+    predictor, Eq. 8 term       (1/N_e) sum_i ||P^(i)(z_t, u_t, a_bar_t) - E_bar(I_t+1)||^2
+    predictor, ensemble mean    ||z_hat_t+1 - E_bar(I_t+1)||^2
+    predictor fed E_bar(I_t)    the ensemble mean with the target latent of I_t as input (no lag)
+      ... u, a_bar shuffled     the same with (u_t, a_bar_t) of other frames: does P_omega use the action?
+    linear map from E(I_t)      ridge regression [z_t, onehot(u_t), a_bar_t, 1] -> E_bar(I_t+1), fitted on training frames
+    linear map from E_bar(I_t)  the same from the target latent
+      ... without u, a_bar      [E_bar(I_t), 1] only
+    cos(pred., true change)     mean cosine of P(E_bar(I_t), u_t, a_bar_t) - E_bar(I_t) and E_bar(I_t+1) - E_bar(I_t)
 
 All distances are squared Euclidean norms summed over the d latent dimensions and averaged over frames, the
 units of Eq. 8. The episode split (data, --val/--val_fraction, --split_seed) is the one stored in the state.
@@ -45,16 +48,18 @@ from config import VPAConfig
 from train_stage1 import _batch_images, _datasets, autocast, pick_device
 
 ROWS = (
-    ("copy_target", "no change, target space (log baseline)"),
+    ("copy_target", "no change, target space"),
     ("copy_online", "no change, online input"),
     ("gap", "online/target gap"),
     ("change_online", "change in online space"),
     ("pred_heads", "predictor, Eq. 8 term (log 'inv')"),
     ("pred_mean", "predictor, ensemble mean"),
     ("pred_from_target", "predictor fed E_bar(I_t)"),
+    ("pred_from_target_shuffled", "  ... u, a_bar shuffled"),
     ("linear_online", "linear map from E(I_t)"),
     ("linear_target", "linear map from E_bar(I_t)"),
-    ("cos_change", "cos(predicted, true change)"),
+    ("linear_target_noact", "  ... without u, a_bar"),
+    ("cos_change", "cos(pred., true change), fed E_bar(I_t)"),
 )
 
 
@@ -81,22 +86,26 @@ def collect(modules: Dict[str, torch.nn.Module], dataset, indices: Sequence[int]
     encoder, target, predictor, normalizer = (modules[k] for k in ("encoder", "target", "predictor", "normalizer"))
     loader = DataLoader(Subset(dataset, list(indices)), batch_size=args.batch_size, shuffle=False,
                         num_workers=args.num_workers, pin_memory=device.type == "cuda")
+    generator = torch.Generator().manual_seed(args.seed)
     out: Dict[str, List[Tensor]] = {k: [] for k in ("z_on", "z_on_next", "z_tg", "z_tg_next", "z_hat", "z_hat_tg",
-                                                    "head_err", "u", "a_bar")}
+                                                    "z_hat_tg_shuffled", "head_err", "u", "a_bar")}
     for batch in loader:
         img = _batch_images(batch, "", normalizer, device)
         fut = _batch_images(batch, "future_", normalizer, device)
         u = batch["primitive"].to(device)
         a_bar = batch["a_bar"].to(device)
+        perm = torch.randperm(u.shape[0], generator=generator).to(device)
         with autocast(device, amp):
             z_on, z_on_next = encoder(img), encoder(fut)
             z_tg, z_tg_next = target(img), target(fut)
             heads = predictor.forward_heads(z_on, u, a_bar)
             heads_tg = predictor.forward_heads(z_tg, u, a_bar)
-        heads, heads_tg, z_tg_next = heads.float(), heads_tg.float(), z_tg_next.float()
+            heads_shuffled = predictor.forward_heads(z_tg, u[perm], a_bar[perm])
+        heads, z_tg_next = heads.float(), z_tg_next.float()
         out["head_err"].append((heads - z_tg_next.unsqueeze(0)).pow(2).sum(-1).mean(0).cpu())
         out["z_hat"].append(heads.mean(0).cpu())
-        out["z_hat_tg"].append(heads_tg.mean(0).cpu())
+        out["z_hat_tg"].append(heads_tg.float().mean(0).cpu())
+        out["z_hat_tg_shuffled"].append(heads_shuffled.float().mean(0).cpu())
         for key, value in (("z_on", z_on), ("z_on_next", z_on_next), ("z_tg", z_tg), ("z_tg_next", z_tg_next),
                            ("u", u), ("a_bar", a_bar)):
             out[key].append(value.float().cpu() if value.is_floating_point() else value.cpu())
@@ -107,10 +116,13 @@ def _sq(a: Tensor, b: Tensor) -> float:
     return float((a.double() - b.double()).pow(2).sum(-1).mean())
 
 
-def features(z: Tensor, u: Tensor, a_bar: Tensor, num_primitives: int, scale: Tensor) -> Tensor:
-    """[z, onehot(u), a_bar / scale, 1] in float64."""
-    onehot = F.one_hot(u.long(), num_primitives).double()
-    return torch.cat([z.double(), onehot, a_bar.double() / scale.double(), torch.ones(len(z), 1, dtype=torch.float64)], 1)
+def features(z: Tensor, u: Optional[Tensor], a_bar: Optional[Tensor], num_primitives: int, scale: Tensor) -> Tensor:
+    """[z, onehot(u), a_bar / scale, 1] in float64 ([z, 1] without u and a_bar)."""
+    parts = [z.double()]
+    if u is not None:
+        parts += [F.one_hot(u.long(), num_primitives).double(), a_bar.double() / scale.double()]
+    parts.append(torch.ones(len(z), 1, dtype=torch.float64))
+    return torch.cat(parts, 1)
 
 
 def ridge(x: Tensor, y: Tensor, rel: float = 1e-4) -> Tensor:
@@ -124,8 +136,9 @@ def metrics(r: Dict[str, Tensor]) -> Dict[str, float]:
     m = {"copy_target": _sq(r["z_tg"], r["z_tg_next"]), "copy_online": _sq(r["z_on"], r["z_tg_next"]),
          "gap": _sq(r["z_on"], r["z_tg"]), "change_online": _sq(r["z_on"], r["z_on_next"]),
          "pred_heads": float(r["head_err"].double().mean()), "pred_mean": _sq(r["z_hat"], r["z_tg_next"]),
-         "pred_from_target": _sq(r["z_hat_tg"], r["z_tg_next"])}
-    d_pred, d_true = (r["z_hat"] - r["z_tg"]).double(), (r["z_tg_next"] - r["z_tg"]).double()
+         "pred_from_target": _sq(r["z_hat_tg"], r["z_tg_next"]),
+         "pred_from_target_shuffled": _sq(r["z_hat_tg_shuffled"], r["z_tg_next"])}
+    d_pred, d_true = (r["z_hat_tg"] - r["z_tg"]).double(), (r["z_tg_next"] - r["z_tg"]).double()
     m["cos_change"] = float(F.cosine_similarity(d_pred, d_true, dim=-1, eps=1e-12).mean())
     return m
 
@@ -161,12 +174,15 @@ def diagnose(args: argparse.Namespace) -> Dict[str, Dict[str, float]]:
                "val": collect(modules, val_ds, pick(val_ds, args.val_frames), args, device, amp)}
     table = {name: metrics(r) for name, r in results.items()}
     scale = predictor.setpoint_scale.cpu()
-    for space, key in (("online", "z_on"), ("target", "z_tg")):
-        fit = results["train"]
-        w = ridge(features(fit[key], fit["u"], fit["a_bar"], cfg.num_primitives, scale), fit["z_tg_next"])
-        for name, r in results.items():
-            pred = features(r[key], r["u"], r["a_bar"], cfg.num_primitives, scale) @ w
-            table[name][f"linear_{space}"] = _sq(pred, r["z_tg_next"])
+    fit = results["train"]
+    def design(r: Dict[str, Tensor], key: str, with_action: bool) -> Tensor:
+        return features(r[key], r["u"] if with_action else None, r["a_bar"], cfg.num_primitives, scale)
+
+    for name, key, with_action in (("linear_online", "z_on", True), ("linear_target", "z_tg", True),
+                                   ("linear_target_noact", "z_tg", False)):
+        w = ridge(design(fit, key, with_action), fit["z_tg_next"])
+        for split_name, r in results.items():
+            table[split_name][name] = _sq(design(r, key, with_action) @ w, r["z_tg_next"])
     stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(args.state)))
     print(f"stage (i) at step {int(state.get('step', -1))} (state saved {stamp}); {len(results['val']['u'])} held-out "
           f"and {len(results['train']['u'])} training frames on {device}{' with bf16' if amp else ''}; "
@@ -175,12 +191,14 @@ def diagnose(args: argparse.Namespace) -> Dict[str, Dict[str, float]]:
     for key, label in ROWS:
         print(f"  {label:42s}{table['val'][key]:12.3f}{table['train'][key]:12.3f}")
     v = table["val"]
-    print("held-out ratios:")
-    print(f"  predictor (mean) / no change, target space  {v['pred_mean'] / max(v['copy_target'], 1e-12):7.3f}   "
-          "(the log ratio uses the Eq. 8 term)")
-    print(f"  predictor (mean) / no change, online input  {v['pred_mean'] / max(v['copy_online'], 1e-12):7.3f}")
-    print(f"  online/target gap / no change, target space {v['gap'] / max(v['copy_target'], 1e-12):7.3f}")
-    print(f"  linear map from E(I_t) / predictor (mean)   {v['linear_online'] / max(v['pred_mean'], 1e-12):7.3f}")
+    ratio = lambda a, b: v[a] / max(v[b], 1e-12)  # noqa: E731
+    print("held-out ratios (below 1: better than the reference):")
+    print(f"  predictor / no change, online input         {ratio('pred_mean', 'copy_online'):7.3f}   as trained (reads E(I_t))")
+    print(f"  predictor fed E_bar / no change, target     {ratio('pred_from_target', 'copy_target'):7.3f}   forecast skill without the lag")
+    print(f"  ... u, a_bar shuffled / not shuffled        {ratio('pred_from_target_shuffled', 'pred_from_target'):7.3f}   "
+          "above 1: P_omega uses the action")
+    print(f"  linear map / no change, target space        {ratio('linear_target', 'copy_target'):7.3f}")
+    print(f"  online/target gap / no change, target space {ratio('gap', 'copy_target'):7.3f}   EMA lag")
     return table
 
 
@@ -194,22 +212,25 @@ def _self_test() -> None:
         out = os.path.join(tmp, "stage1.pt")
         train_stage1(stage1_args([train_file, "--out", out, "--batch_size", "8", "--num_workers", "0", "--device", "cpu",
                                   "--steps", "2", "--val_fraction", "0.34", "--log_every", "1", "--warmup_steps", "1"]))
-        args = parse_args([out + ".state.pt", "--val_frames", "24", "--train_frames", "48", "--batch_size", "8",
-                           "--num_workers", "0", "--device", "cpu"])
-        table = diagnose(args)
+        small = ["--val_frames", "24", "--train_frames", "48", "--batch_size", "8", "--num_workers", "0", "--device", "cpu"]
+        table = diagnose(parse_args([out + ".state.pt", *small]))
         for name in ("val", "train"):
             m = table[name]
             assert all(np.isfinite(list(m.values())))
             assert min(v for k, v in m.items() if k != "cos_change") >= 0.0 and -1.0 <= m["cos_change"] <= 1.0
             assert m["pred_heads"] >= m["pred_mean"] - 1e-6                     # Jensen: heads vs their mean
-        # identical encoders: no gap, and the two "no change" baselines coincide
+        # identical encoders: no gap, both "no change" baselines and both predictor inputs coincide
         state = torch.load(out + ".state.pt", map_location="cpu", weights_only=True)
         state["target"] = {f"encoder.{k}": v for k, v in state["encoder"].items()}
         torch.save(state, out + ".same.pt")
-        table = diagnose(parse_args([out + ".same.pt", "--val_frames", "24", "--train_frames", "48", "--batch_size", "8",
-                                     "--num_workers", "0", "--device", "cpu"]))
-        assert table["val"]["gap"] < 1e-9 and abs(table["val"]["copy_online"] - table["val"]["copy_target"]) < 1e-6
-        assert abs(table["val"]["pred_from_target"] - table["val"]["pred_mean"]) < 1e-6
+        m = diagnose(parse_args([out + ".same.pt", *small]))["val"]
+        assert m["gap"] < 1e-9 and abs(m["copy_online"] - m["copy_target"]) < 1e-6
+        assert abs(m["pred_from_target"] - m["pred_mean"]) < 1e-6
+        # ridge regression recovers an exact linear map
+        g = torch.Generator().manual_seed(0)
+        x = torch.randn(200, 5, generator=g, dtype=torch.float64)
+        w = torch.randn(5, 3, generator=g, dtype=torch.float64)
+        assert torch.allclose(ridge(x, x @ w, rel=1e-12), w, atol=1e-6)
     print("diagnose_stage1.py self-test passed")
 
 
