@@ -114,6 +114,7 @@ python train_stage1.py --self-test
 python cache_latents.py --self-test
 python train_stage2.py --self-test
 python calibrate_sigma.py --self-test   # the whole chain on dry-run data, checked against the closed loop
+python diagnose_stage1.py --self-test
 
 # the release checks: headers, licence files, citation metadata, lint and all self-tests
 python scripts/check_release.py --run-tests
@@ -216,6 +217,10 @@ python calibrate_sigma.py checkpoints/policy.pt "data_val/*.hdf5"
   prediction error relative to the "no change" baseline. Before a long run, check the throughput with
   `--steps 300 --log_every 50`: the log prints samples/s and the fraction of time spent waiting for data
   (raise `--num_workers` if it is high; `--compile` speeds up the encoder on recent GPUs).
+* The "no change" baseline of the stage-(i) log is computed in the EMA target space, while the predictor reads
+  the online latent, so the logged ratio also contains the lag between the two encoders.
+  `python diagnose_stage1.py checkpoints/stage1.pt.state.pt` separates the two (and compares the predictor with a
+  linear map) on held-out and training frames; it reads the training state and can run during training.
 * Stage (ii) holds all frames in memory (about 2.4 KB per frame, on the GPU when it fits) and reports L_CFM,
   L_CE, selector accuracy and recall per primitive, and the error of generated chunks against the expert in m/s.
 * The (1 - p_fa)-quantile behind sigma_crit needs many decisions: with p_fa = n_fa / (f_dec T_mis) = 1.7e-5 at
@@ -237,6 +242,7 @@ python calibrate_sigma.py checkpoints/policy.pt "data_val/*.hdf5"
 | `inspect_hdf5.py` | Secs. 3.1-3.4 | prints a demonstration file and validates it against `VPAConfig` |
 | `checkpoint.py` | Secs. 3.5, 3.8 | one-file checkpoints (config, networks, frozen statistics, provenance) |
 | `train_stage1.py` | Secs. 3.2, 3.8, Eqs. 8-11 | stage (i): E_psi and P_omega with VICReg, EMA target and gamma tracking |
+| `diagnose_stage1.py` | Sec. 3.2, Eq. 8 | splits the stage-(i) prediction error into predictor error and EMA-target lag |
 | `cache_latents.py` | Sec. 3.8 | z_t, z_hat_{t+1} and sigma_{t+1} of the frozen stage-(i) networks per frame |
 | `train_stage2.py` | Secs. 3.3, 3.4, 3.8, Eq. 30 | stage (ii): selector, CFM solver and null instruction embedding |
 | `calibrate_sigma.py` | Sec. 3.5, Eq. 23 | sigma_lo and sigma_crit from validation flights, written into the checkpoint |

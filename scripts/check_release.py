@@ -55,7 +55,8 @@ GPL3_LINES = 674
 # Self-test commands in dependency order (a script with options runs as "python <file> <options>").
 SELF_TESTS = ("config.py", "perception.py", "predictor.py", "selector.py", "solver.py", "pipeline.py",
               "checkpoint.py", "sim/expert.py", "dataset.py", "train_stage1.py --self-test",
-              "cache_latents.py --self-test", "train_stage2.py --self-test", "calibrate_sigma.py --self-test")
+              "cache_latents.py --self-test", "train_stage2.py --self-test", "calibrate_sigma.py --self-test",
+              "diagnose_stage1.py --self-test")
 LINT_COMMAND = ("ruff", "check", "--select", "F,E9,B,PLE,PLW", ".")
 EXPECTED_FILES = (
     *(command.split()[0] for command in SELF_TESTS),
