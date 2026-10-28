@@ -346,7 +346,7 @@ fi
 
 # The camera must actually render (this is where a missing GPU/EGL setup shows up).
 wait_for "first depth frame on $DEPTH_TOPIC" "$START_TIMEOUT" gz "$RUN_DIR/gz.log" \
-    timeout 10 gz topic -e -n 1 -t "$DEPTH_TOPIC"
+    timeout -k 2 10 gz topic -e -n 1 -t "$DEPTH_TOPIC"
 
 # ---------------------------------------------------------------------------------- 5. ROS 2 bridge
 if [[ $BRIDGE -eq 1 ]]; then
@@ -363,11 +363,13 @@ if [[ $BRIDGE -eq 1 ]]; then
         bash -c "ros2 topic list --no-daemon | grep -qx /fmu/out/vehicle_odometry"
     # Frames, not just topics: a bridge can advertise both image topics and still deliver nothing
     # (the collector then stops with "no data after 60 s on: synchronised ... image + depth_image").
+    # Every probe is bounded by SIGKILL (-k): ros2 topic echo can outlive the SIGTERM of a plain timeout,
+    # which once stalled a start-up for good at exactly this wait.
     wait_for "RGB and depth frames in ROS 2" "$START_TIMEOUT" bridge "$RUN_DIR/bridge.log" \
-        bash -c "timeout 10 ros2 topic echo --once '$DEPTH_TOPIC' sensor_msgs/msg/Image >/dev/null &&
-                 timeout 10 ros2 topic echo --once '$RGB_TOPIC' sensor_msgs/msg/Image >/dev/null"
+        bash -c "timeout -k 2 10 ros2 topic echo --once '$DEPTH_TOPIC' sensor_msgs/msg/Image >/dev/null &&
+                 timeout -k 2 10 ros2 topic echo --once '$RGB_TOPIC' sensor_msgs/msg/Image >/dev/null"
     wait_for "simulation clock in ROS 2" "$START_TIMEOUT" bridge "$RUN_DIR/bridge.log" \
-        timeout 10 ros2 topic echo --once /clock rosgraph_msgs/msg/Clock
+        timeout -k 2 10 ros2 topic echo --once /clock rosgraph_msgs/msg/Clock
 fi
 export AERO_VPA_RGB_TOPIC="$RGB_TOPIC" AERO_VPA_DEPTH_TOPIC="$DEPTH_TOPIC"
 
