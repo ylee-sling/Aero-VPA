@@ -10,23 +10,37 @@ the frozen networks are run frame by frame exactly as the closed loop runs them 
     sigma_{t+1} = P_omega(z_t, Embed(u_t), a_bar_t)  (Eq. 22),
     sigma_bar_{t+1} = max{ sigma_{t+1}, (1 - alpha_sigma) sigma_bar_t + alpha_sigma sigma_{t+1} }   (Eq. 23, from 0)
 
-and the thresholds are set to the empirical quantiles of sigma_bar over all decisions:
+and sigma_lo is set to the 0.9-quantile of sigma_bar over all decisions. sigma_crit bounds the spurious
+fallbacks (sigma_bar >= sigma_crit: brake to hover) at n_fa = 0.05 per in-distribution mission of T_mis = 60 s,
+estimated in one of two ways (both are always reported; --method chooses the one written):
 
-    sigma_lo   = 0.9-quantile
-    sigma_crit = (1 - p_fa)-quantile,   p_fa = n_fa / (f_dec T_mis)
+    frame        sigma_crit = (1 - p_fa)-quantile of sigma_bar over all decisions,  p_fa = n_fa / (f_dec T_mis)
+                 (Sec. 3.5; f_dec is the decision rate, by default the frame rate of the data). This treats the
+                 f_dec T_mis decisions of a mission as independent.
+    episode_max  sigma_crit from the maximum of sigma_bar over each validation flight. A fallback episode starts
+                 when sigma_bar first reaches sigma_crit, so the budget is a statement about the per-flight
+                 maximum M_i. With flights of different durations L_i, onsets are modelled as a Poisson process
+                 of rate lambda(c): P(M_i >= c) = 1 - exp(-lambda(c) L_i); lambda is the maximum-likelihood
+                 estimate from the flights that do and do not reach c, and sigma_crit is the lowest level with
+                 P(mission of T_mis falls back) = 1 - exp(-lambda T_mis) <= n_fa, placed midway between
+                 consecutive flight maxima. With every L_i = T_mis this is the (1 - n_fa)-quantile of the M_i.
+                 A bootstrap over flights gives a confidence interval.
 
-with n_fa = 0.05 spurious fallbacks per mission of T_mis = 60 s and f_dec the decision rate (default: the
-frame rate of the data, since every camera frame is a decision). They are written into the checkpoint's
-config, with the full report under provenance["sigma_calibration"].
+sigma_bar is strongly correlated from one decision to the next (lag-1 autocorrelation near 1 at 50 Hz), so
+the frame quantile needs on the order of 10 / p_fa * (1 + rho) / (1 - rho) decisions, far more than any
+validation set; the per-flight maximum needs about 10 / n_fa flights (200 for 10 exceedances at n_fa = 0.05).
+The thresholds are written into the checkpoint's config, with the full report (both methods) under
+provenance["sigma_calibration"].
 
     python calibrate_sigma.py checkpoints/policy.pt "data_val/*.hdf5"                 # updates the checkpoint
     python calibrate_sigma.py checkpoints/policy.pt "data_val/*.hdf5" --out policy_cal.pt
     python calibrate_sigma.py checkpoints/policy.pt "data_val/*.hdf5" --dry_run       # report only
+    python calibrate_sigma.py checkpoints/policy.pt "data_val/*.hdf5" --method episode_max --out policy_cal.pt
     python calibrate_sigma.py --self-test
 
-Consecutive sigma_bar are strongly correlated, so the tail quantile needs a large validation set (Sec. 3.5).
 The report estimates the effective number of independent decisions from the lag-1 autocorrelation and warns
-when fewer than 10 exceedances of sigma_crit are expected: sigma_crit is then not resolved by the data.
+when fewer than 10 exceedances (frame) or fewer than 10 flights above sigma_crit (episode_max) are expected:
+sigma_crit is then not resolved by the data.
 """
 
 from __future__ import annotations
@@ -49,7 +63,8 @@ from solver import SafetyFilter
 from train_stage1 import autocast, data_summary, pick_device
 from train_stage2 import InstructionTable, clip_embeddings
 
-__all__ = ["episode_sigmas", "filtered_sigma", "thresholds", "calibrate", "parse_args"]
+__all__ = ["episode_sigmas", "filtered_sigma", "thresholds", "onset_rate_mle", "episode_max_threshold",
+           "mission_fallback_probability", "calibrate", "parse_args"]
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -62,6 +77,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--n_fa", type=float, default=0.05, help="tolerated spurious fallbacks per mission")
     p.add_argument("--mission_s", type=float, default=60.0, help="mission duration T_mis (s)")
     p.add_argument("--decision_hz", type=float, default=0.0, help="f_dec (0: the frame rate of the data)")
+    p.add_argument("--method", choices=["frame", "episode_max"], default="frame",
+                   help="sigma_crit written to the checkpoint: frame quantile or per-flight maximum (both reported)")
+    p.add_argument("--bootstrap", type=int, default=1000, help="resamples of flights for the episode_max interval")
+    p.add_argument("--seed", type=int, default=0, help="seed of the bootstrap")
     p.add_argument("--primitive", choices=["selector", "expert"], default="selector",
                    help="primitive conditioning P_omega: the selector's choice (as deployed) or the expert label")
     p.add_argument("--include_failed", action="store_true")
@@ -170,6 +189,105 @@ def thresholds(sigma_bar: Sequence[np.ndarray], q_lo: float, p_fa: float) -> Dic
     }
 
 
+def onset_rate_mle(reached: np.ndarray, durations: np.ndarray) -> float:
+    """Maximum-likelihood onset rate lambda (1/s) from per-flight first-passage outcomes and flight durations.
+
+    Flight i of duration L_i reaches the level with probability 1 - exp(-lambda L_i) (onsets of sigma_bar >= level
+    form a Poisson process). The log-likelihood sum_reached log(1 - exp(-lambda L_i)) - lambda sum_others L_i is
+    concave; its score sum_reached L_i / (exp(lambda L_i) - 1) - sum_others L_i decreases in lambda and is solved
+    by bisection in log lambda. 0 when no flight reaches the level, inf when every flight does.
+    """
+    reached = np.asarray(reached, dtype=bool)
+    durations = np.asarray(durations, dtype=np.float64)
+    if reached.ndim != 1 or reached.shape != durations.shape:
+        raise ValueError("reached and durations must be 1-D arrays of the same length")
+    if not bool(np.all(durations > 0.0)):
+        raise ValueError("flight durations must be positive")
+    if not reached.any():
+        return 0.0
+    rest = float(durations[~reached].sum())
+    if rest == 0.0:
+        return math.inf
+    hit = durations[reached]
+    lo = math.log(1e-12 / float(hit.max()))          # score > 0 here: about k / lambda
+    hi = math.log(50.0 / float(hit.min()))           # score ~ -rest here
+    with np.errstate(over="ignore"):
+        for _ in range(80):
+            mid = 0.5 * (lo + hi)
+            if float(np.sum(hit / np.expm1(math.exp(mid) * hit))) > rest:
+                lo = mid
+            else:
+                hi = mid
+    return math.exp(0.5 * (lo + hi))
+
+
+def mission_fallback_probability(rate: float, mission_s: float) -> float:
+    """P(an in-distribution mission of T_mis reaches the level) = 1 - exp(-lambda T_mis)."""
+    return 1.0 if math.isinf(rate) else -math.expm1(-rate * mission_s)
+
+
+def _crit_from_maxima(maxima: np.ndarray, durations: np.ndarray, n_fa: float, mission_s: float
+                      ) -> Tuple[float, int, float]:
+    """(sigma_crit, flights above it, P(mission falls back)): the lowest level, midway between consecutive flight
+    maxima, whose estimated mission fallback probability is at most n_fa."""
+    n = maxima.size
+    order = np.argsort(-maxima, kind="stable")
+    desc = maxima[order]
+
+    def prob(k: int) -> float:                       # the k flights with the largest maxima reach the level
+        reached = np.zeros(n, dtype=bool)
+        reached[order[:k]] = True
+        return mission_fallback_probability(onset_rate_mle(reached, durations), mission_s)
+
+    lo, hi = 0, n                                    # prob(0) = 0 <= n_fa < 1 = prob(n); prob is non-decreasing
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if prob(mid) <= n_fa:
+            lo = mid
+        else:
+            hi = mid
+    k = lo
+    while 0 < k < n and desc[k - 1] == desc[k]:      # a threshold cannot split tied maxima
+        k -= 1
+    if k == 0:                                       # not even one flight above sigma_crit fits the budget
+        return float(np.nextafter(desc[0], np.inf)), 0, 0.0
+    return 0.5 * float(desc[k - 1] + desc[k]), k, prob(k)
+
+
+def episode_max_threshold(sigma_bar: Sequence[np.ndarray], durations: Sequence[float], n_fa: float,
+                          mission_s: float, bootstrap: int = 0, seed: int = 0) -> Dict[str, Any]:
+    """sigma_crit from the per-flight maxima of sigma_bar (method episode_max), with a bootstrap over flights."""
+    if not 0.0 < n_fa < 1.0:
+        raise ValueError("n_fa must lie in (0, 1)")
+    if not mission_s > 0.0:
+        raise ValueError("mission_s must be positive")
+    maxima = np.array([float(np.max(s)) for s in sigma_bar], dtype=np.float64)
+    durations = np.asarray(durations, dtype=np.float64)
+    if maxima.size == 0 or durations.shape != maxima.shape:
+        raise ValueError("need one duration per flight and at least one flight")
+    crit, above, prob = _crit_from_maxima(maxima, durations, n_fa, mission_s)
+    rate = onset_rate_mle(maxima >= crit, durations)
+    target = -math.log1p(-n_fa) / mission_s          # onset rate that spends the budget exactly
+    per_flight = -math.expm1(-target * float(durations.mean()))
+    out: Dict[str, Any] = {
+        "sigma_crit": crit, "flights": int(maxima.size), "flights_above": above, "resolved": bool(above >= 10),
+        "mission_fallback_probability": prob, "onset_rate_per_hour": 3600.0 * rate, "n_fa": n_fa,
+        "mission_s": mission_s, "flights_for_10_above": 10.0 / per_flight,
+        "flight_s_mean": float(durations.mean()), "flight_s_min": float(durations.min()),
+        "flight_s_max": float(durations.max()), "flight_max_median": float(np.median(maxima)),
+        "flight_max_p95": float(np.quantile(maxima, 0.95)), "flight_max_max": float(maxima.max()),
+    }
+    if bootstrap > 0:
+        rng = np.random.default_rng(seed)
+        draws = np.empty(bootstrap)
+        for b in range(bootstrap):
+            idx = rng.integers(0, maxima.size, maxima.size)
+            draws[b] = _crit_from_maxima(maxima[idx], durations[idx], n_fa, mission_s)[0]
+        out.update(bootstrap=int(bootstrap), ci_low=float(np.quantile(draws, 0.025)),
+                   ci_high=float(np.quantile(draws, 0.975)))
+    return out
+
+
 def calibrate(args: argparse.Namespace) -> Dict[str, Any]:
     """Compute the thresholds; write them unless --dry_run. Returns the report."""
     ckpt = load_checkpoint(args.checkpoint, kind="policy")
@@ -182,7 +300,19 @@ def calibrate(args: argparse.Namespace) -> Dict[str, Any]:
     sigma_bar = filtered_sigma([sigmas[k] for k in keys], cfg.alpha_sigma)
     f_dec = args.decision_hz if args.decision_hz > 0 else 1.0 / float(np.median(dts))
     p_fa = args.n_fa / (f_dec * args.mission_s)
-    report = thresholds(sigma_bar, args.q_lo, p_fa)
+    report = thresholds(sigma_bar, args.q_lo, p_fa)                       # sigma_lo and the frame method
+    durations = np.array([len(sb) for sb in sigma_bar], dtype=np.float64) / f_dec
+    maxima = np.array([float(sb.max()) for sb in sigma_bar])
+    frame = {k: report[k] for k in ("sigma_crit", "p_fa", "effective_decisions", "expected_exceedances", "resolved",
+                                    "fraction_above_crit", "episodes_reaching_crit")}
+    frame["mission_fallback_probability"] = mission_fallback_probability(
+        onset_rate_mle(maxima >= frame["sigma_crit"], durations), args.mission_s)
+    episode = episode_max_threshold(sigma_bar, durations, args.n_fa, args.mission_s, args.bootstrap, args.seed)
+    chosen = frame if args.method == "frame" else episode
+    allv = np.concatenate(sigma_bar)
+    report.update({"method": args.method, "frame": frame, "episode_max": episode, "sigma_crit": chosen["sigma_crit"],
+                   "resolved": chosen["resolved"], "fraction_above_crit": float((allv >= chosen["sigma_crit"]).mean()),
+                   "episodes_reaching_crit": int((maxima >= chosen["sigma_crit"]).sum())})
     if not report["sigma_lo"] < report["sigma_crit"]:
         raise ValueError(f"degenerate sigma_bar distribution: sigma_lo {report['sigma_lo']} >= sigma_crit "
                          f"{report['sigma_crit']}; use more (and longer) validation flights")
@@ -194,14 +324,26 @@ def calibrate(args: argparse.Namespace) -> Dict[str, Any]:
           f"p_fa = {p_fa:.2e}")
     print(f"[calibrate] sigma_bar: median {report['sigma_bar_median']:.4f}, p99 {report['sigma_bar_p99']:.4f}, "
           f"max {report['sigma_bar_max']:.4f}; lag-1 autocorrelation {report['lag1_autocorrelation']:.4f}")
-    print(f"[calibrate] sigma_lo = {report['sigma_lo']:.4f} (q {args.q_lo}), sigma_crit = {report['sigma_crit']:.4f} "
-          f"(q {1 - p_fa:.6f}); {report['episodes_reaching_crit']} of {report['episodes']} episodes reach sigma_crit")
-    if not report["resolved"]:
+    n_flights, mis = report["episodes"], f"P(fallback in a {args.mission_s:g} s mission)"
+    print(f"[calibrate] sigma_lo = {report['sigma_lo']:.4f} (q {args.q_lo})")
+    print(f"[calibrate] frame:       sigma_crit = {frame['sigma_crit']:.4f} (q {1 - p_fa:.6f}); "
+          f"{frame['episodes_reaching_crit']} of {n_flights} flights reach it; {mis} = "
+          f"{frame['mission_fallback_probability']:.4f}{'' if frame['resolved'] else ' (not resolved)'}")
+    ci = f" [95% CI {episode['ci_low']:.4f}, {episode['ci_high']:.4f}]" if "ci_low" in episode else ""
+    print(f"[calibrate] episode_max: sigma_crit = {episode['sigma_crit']:.4f}{ci}; {episode['flights_above']} of "
+          f"{n_flights} flights reach it; {mis} = {episode['mission_fallback_probability']:.4f} (n_fa {args.n_fa:g}); "
+          f"flights {episode['flight_s_mean']:.1f} s ({episode['flight_s_min']:.1f}-{episode['flight_s_max']:.1f} s)"
+          f"{'' if episode['resolved'] else ' (not resolved)'}")
+    if args.method == "frame" and not frame["resolved"]:
         need = 10.0 / p_fa * (1 + report["lag1_autocorrelation"]) / max(1e-6, 1 - report["lag1_autocorrelation"])
-        print(f"[calibrate] WARNING: only {report['expected_exceedances']:.2f} exceedances of sigma_crit are expected "
-              f"among {report['effective_decisions']:.0f} effective decisions: sigma_crit is not resolved by this "
-              f"validation set (about {need:.3g} decisions would give 10). Use more validation flights before relying "
-              f"on the fallback threshold (Sec. 3.5, ablation A2).")
+        print(f"[calibrate] WARNING: only {frame['expected_exceedances']:.2f} exceedances of sigma_crit are expected "
+              f"among {frame['effective_decisions']:.0f} effective decisions: sigma_crit is not resolved by this "
+              f"validation set (about {need:.3g} decisions would give 10). Use more validation flights, or "
+              f"--method episode_max, before relying on the fallback threshold (Sec. 3.5, ablation A2).")
+    if args.method == "episode_max" and not episode["resolved"]:
+        print(f"[calibrate] WARNING: only {episode['flights_above']} validation flights lie above sigma_crit (fewer "
+              f"than 10): sigma_crit is not resolved (about {episode['flights_for_10_above']:.0f} flights of this "
+              f"length would give 10).")
     if args.dry_run:
         return report
     ckpt["config"]["sigma_lo"] = report["sigma_lo"]
@@ -210,7 +352,7 @@ def calibrate(args: argparse.Namespace) -> Dict[str, Any]:
     ckpt["checkpoint_id"] = uuid.uuid4().hex
     out = args.out or args.checkpoint
     save_checkpoint(out, ckpt)
-    print(f"[calibrate] wrote {out} (id {ckpt['checkpoint_id'][:8]})")
+    print(f"[calibrate] wrote {out} (id {ckpt['checkpoint_id'][:8]}) with sigma_crit from method {args.method}")
     report["checkpoint_out"] = ckpt["checkpoint_id"]
     return report
 
@@ -218,8 +360,57 @@ def calibrate(args: argparse.Namespace) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------------------------
 # Self-test (run: python calibrate_sigma.py --self-test): the whole training chain on dry-run data
 # ---------------------------------------------------------------------------------------------
+def _episode_max_unit_tests() -> None:
+    rng = np.random.default_rng(0)
+    # onset-rate MLE: closed form for equal durations; a stationary point of the concave likelihood otherwise
+    reached = np.zeros(50, dtype=bool)
+    reached[:10] = True
+    assert math.isclose(onset_rate_mle(reached, np.full(50, 30.0)), math.log(50 / 40) / 30.0, rel_tol=1e-9)
+    durations = rng.uniform(5.0, 80.0, 40)
+    hit = rng.random(40) < 0.3
+    lam = onset_rate_mle(hit, durations)
+    loglik = lambda r: float(np.sum(np.log(-np.expm1(-r * durations[hit]))) - r * durations[~hit].sum())  # noqa: E731
+    assert loglik(lam) >= max(loglik(lam * 0.999), loglik(lam * 1.001))
+    assert onset_rate_mle(np.zeros(5, bool), np.ones(5)) == 0.0 and math.isinf(onset_rate_mle(np.ones(5, bool), np.ones(5)))
+    assert mission_fallback_probability(math.inf, 60.0) == 1.0 and mission_fallback_probability(0.0, 60.0) == 0.0
+    # flights of exactly T_mis: the (1 - n_fa)-quantile of the maxima, midway between order statistics
+    maxima = rng.permutation(np.arange(1.0, 201.0))
+    out = episode_max_threshold([np.array([0.0, m, 0.5 * m]) for m in maxima], np.full(200, 60.0), 0.0525, 60.0)
+    assert out["sigma_crit"] == 190.5 and out["flights_above"] == 10 and out["resolved"]
+    assert math.isclose(out["mission_fallback_probability"], 0.05, rel_tol=1e-6)
+    # tied maxima are not split; a budget that no single flight fits gives a level above every maximum
+    tied_flights = [np.array([v]) for v in [5.0] * 3 + [1.0] * 17]
+    tied = episode_max_threshold(tied_flights, np.full(20, 60.0), 0.16, 60.0)        # 3 of 20 allowed: all three
+    assert tied["sigma_crit"] == 3.0 and tied["flights_above"] == 3
+    tied = episode_max_threshold(tied_flights, np.full(20, 60.0), 0.12, 60.0)        # 2 allowed: cannot split 3 ties
+    assert tied["flights_above"] == 0 and tied["sigma_crit"] > 5.0
+    few = episode_max_threshold([np.array([v]) for v in (1.0, 2.0, 3.0)], np.full(3, 60.0), 0.05, 60.0)
+    assert few["flights_above"] == 0 and few["sigma_crit"] > 3.0 and not few["resolved"]
+    # flights shorter than the mission: the Poisson length correction recovers the true level, the plain
+    # quantile of the maxima does not. Truth: lambda(c) = exp(-c) per second, so lambda(c*) T_mis = -log(1 - n_fa).
+    n, n_fa, t_mis = 20000, 0.05, 60.0
+    lengths = rng.uniform(5.0, 30.0, n)
+    v = rng.random(n)                                       # P(M >= m) = 1 - exp(-exp(-m) L)  ->  inverse transform
+    flight_max = -np.log(-np.log1p(-v) / lengths)
+    truth = -math.log(-math.log1p(-n_fa) / t_mis)
+    est = episode_max_threshold([np.array([m]) for m in flight_max], lengths, n_fa, t_mis, bootstrap=50, seed=1)
+    assert abs(est["sigma_crit"] - truth) < 0.1, (est["sigma_crit"], truth)
+    assert abs(float(np.quantile(flight_max, 1 - n_fa)) - truth) > 0.5
+    assert est["ci_low"] <= est["sigma_crit"] <= est["ci_high"] and est["ci_high"] - est["ci_low"] < 0.5
+    for bad in (dict(n_fa=0.0), dict(n_fa=1.0), dict(mission_s=0.0)):
+        kwargs = dict(n_fa=0.05, mission_s=60.0)
+        kwargs.update(bad)
+        try:
+            episode_max_threshold([np.ones(3)], [1.0], **kwargs)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad}")
+
+
 def _self_test() -> None:
     import tempfile
+
+    _episode_max_unit_tests()
 
     from cache_latents import cache_latents, parse_args as cache_args
     from pipeline import VPAInferencePipeline
@@ -294,6 +485,18 @@ def _self_test() -> None:
         dry = calibrate(parse_args([policy, val_file, "--dry_run", "--num_workers", "0", "--device", "cpu",
                                     "--primitive", "expert"]))
         assert load_checkpoint(policy)["checkpoint_id"] == after["checkpoint_id"] and dry["primitive_source"] == "expert"
+        # method episode_max: written to the checkpoint; frame value and sigma_lo unchanged in the report
+        assert report["method"] == "frame" and report["frame"]["sigma_crit"] == report["sigma_crit"]
+        out_ep = os.path.join(tmp, "policy_ep.pt")
+        ep = calibrate(parse_args([policy, val_file, "--method", "episode_max", "--bootstrap", "20", "--out", out_ep,
+                                   "--num_workers", "0", "--device", "cpu"]))
+        written = load_checkpoint(out_ep, kind="policy")
+        assert ep["method"] == "episode_max" and written["config"]["sigma_crit"] == ep["episode_max"]["sigma_crit"]
+        assert written["config"]["sigma_lo"] == ep["sigma_lo"] == report["sigma_lo"]
+        assert ep["frame"]["sigma_crit"] == report["sigma_crit"] and ep["episode_max"]["flights"] == 2
+        maxima = [float(b.max()) for b in ref_bar]
+        assert ep["episode_max"]["sigma_crit"] > max(maxima) and not ep["resolved"]       # 2 flights: unresolved
+        assert written["provenance"]["sigma_calibration"]["episode_max"]["bootstrap"] == 20
     print("calibrate_sigma.py self-test passed")
 
 

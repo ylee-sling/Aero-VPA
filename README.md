@@ -227,9 +227,15 @@ python calibrate_sigma.py checkpoints/policy.pt "data_val/*.hdf5"
   `--residual_init` scales the default initialisation of the output layer (1: unchanged, 0: start at persistence).
 * Stage (ii) holds all frames in memory (about 2.4 KB per frame, on the GPU when it fits) and reports L_CFM,
   L_CE, selector accuracy and recall per primitive, and the error of generated chunks against the expert in m/s.
-* The (1 - p_fa)-quantile behind sigma_crit needs many decisions: with p_fa = n_fa / (f_dec T_mis) = 1.7e-5 at
-  50 Hz, roughly 10^6 or more correlated decisions (hours of validation flight) give 10 expected exceedances.
-  `calibrate_sigma.py` reports the effective sample size and warns when sigma_crit is not resolved.
+* sigma_crit (n_fa = 0.05 spurious fallbacks per 60 s mission) has two estimators, both always reported.
+  `--method frame` (default, Sec. 3.5) takes the (1 - p_fa)-quantile of sigma_bar over all decisions with
+  p_fa = n_fa / (f_dec T_mis) = 1.7e-5 at 50 Hz; sigma_bar is so correlated from one decision to the next that this
+  needs far more decisions than a validation set holds (the report gives the effective sample size and warns).
+  `--method episode_max` works with the maximum of sigma_bar over each validation flight, models fallback onsets
+  as a Poisson process to correct for flight durations, and puts sigma_crit where the estimated probability of a
+  fallback in a 60 s mission equals n_fa, with a bootstrap interval over flights; about 10 / n_fa = 200 flights
+  resolve it. On 360 validation flights: `calibrate_sigma.py checkpoints/policy.pt "data_val/*.hdf5"
+  --method episode_max --out checkpoints/policy_cal.pt`.
 * Dataset aggregation, stage (iii) of Sec. 3.8 (DAgger), needs a closed-loop policy node in SITL and is the next step.
 
 ## Repository layout
