@@ -221,6 +221,10 @@ python calibrate_sigma.py checkpoints/policy.pt "data_val/*.hdf5"
   the online latent, so the logged ratio also contains the lag between the two encoders.
   `python diagnose_stage1.py checkpoints/stage1.pt.state.pt` separates the two (and compares the predictor with a
   linear map) on held-out and training frames; it reads the training state and can run during training.
+* `train_stage1.py --residual_predictor` makes every head forecast the change, z_hat^(i) = z_t + f^(i)(...), with the
+  Table 1 layers and parameter count; sigma (Eq. 22) is unchanged in value. The choice is stored in the checkpoint,
+  so `cache_latents.py`, `train_stage2.py`, `calibrate_sigma.py` and the pipeline rebuild the same predictor.
+  `--residual_init` scales the default initialisation of the output layer (1: unchanged, 0: start at persistence).
 * Stage (ii) holds all frames in memory (about 2.4 KB per frame, on the GPU when it fits) and reports L_CFM,
   L_CE, selector accuracy and recall per primitive, and the error of generated chunks against the expert in m/s.
 * The (1 - p_fa)-quantile behind sigma_crit needs many decisions: with p_fa = n_fa / (f_dec T_mis) = 1.7e-5 at

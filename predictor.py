@@ -28,6 +28,12 @@ Changes from VPA (preprint_261008)
       Eq. 7; the scale must be fixed before stage (i) because it is part of the frozen model.
     * sigma is computed in at least float32 from the head outputs.
     * Eq. 11 moves here from the VPA milestone tracker, which Aero-VPA does not have.
+    * Optional residual heads (``residual=True``; config ``predictor_residual``): each head forecasts the change,
+          z_hat^(i)_{t+1} = z_t + f^(i)( Concat(z_t, Embed(u_t), a_bar_t) ),
+      with the same Table 1 layers and parameter count, so persistence costs nothing and the capacity goes to
+      the 0.1 s transition. sigma (Eq. 22) has the same value (z_t cancels) and is computed from the changes,
+      which avoids cancellation at low precision. The output layer keeps its independent default
+      initialisation scaled by ``residual_init_scale`` (1: unchanged; 0: every head starts at z_t).
 
 Tensor layout
     z_t ``[B, 256]``, u_t ``[B]`` int64, a_bar_t ``[B, 4]`` (v_x, v_y, v_z, yaw rate in the heading frame
@@ -138,10 +144,14 @@ class JEPAPredictor(nn.Module):
         num_hidden_layers: number of hidden layers per head (>= 1).
         setpoint_scale: ``[d_a]`` positive divisor of a_bar_t (the action-box bounds
             (v_h, v_h, v_z, yaw rate)); None means ones, the literal Eq. 7.
+        residual: heads forecast the change, z_hat^(i)_{t+1} = z_t + f^(i)(.). No extra parameters.
+        residual_init_scale: factor (>= 0) on the default initialisation of the output layer of f^(i) when
+            ``residual``; 0 starts every head exactly at persistence (and sigma at 0).
 
     Shapes:
         ``head_input``:    (``z_t [B, d]``, ``u_t [B]`` int64, ``a_bar [B, d_a]``) -> ``[B, d + d_u + d_a]``
         ``forward_heads``: same inputs -> ``[N_e, B, d]``
+        ``forward_deltas``: same inputs -> ``[N_e, B, d]`` (residual heads only: z_hat^(i)_{t+1} - z_t)
         ``forward``:       same inputs -> ``PredictorOutput`` (z_hat ``[B, d]``, sigma ``[B]``,
                            head_predictions ``[N_e, B, d]``)
         ``ensemble_uncertainty``: ``[N_e, B, d]`` (+ optional ``z_hat [B, d]``) -> ``[B]``
@@ -157,6 +167,8 @@ class JEPAPredictor(nn.Module):
         hidden_dim: int = 512,
         num_hidden_layers: int = 2,
         setpoint_scale: Optional[Sequence[float]] = None,
+        residual: bool = False,
+        residual_init_scale: float = 1.0,
     ) -> None:
         super().__init__()
         if num_heads < 2:
@@ -177,6 +189,14 @@ class JEPAPredictor(nn.Module):
             layers += [EnsembleLinear(num_heads, hidden_dim, hidden_dim), nn.GELU()]
         layers.append(EnsembleLinear(num_heads, hidden_dim, latent_dim))
         self.heads = nn.Sequential(*layers)
+        if not (math.isfinite(residual_init_scale) and residual_init_scale >= 0.0):
+            raise ValueError("residual_init_scale must be finite and non-negative")
+        self.residual: bool = bool(residual)
+        self.residual_init_scale: float = float(residual_init_scale)
+        if self.residual and self.residual_init_scale != 1.0:
+            with torch.no_grad():
+                self.heads[-1].weight.mul_(self.residual_init_scale)
+                self.heads[-1].bias.mul_(self.residual_init_scale)
         if setpoint_scale is None:
             scale = torch.ones(setpoint_dim)
         else:
@@ -219,10 +239,21 @@ class JEPAPredictor(nn.Module):
         setpoint = a_bar.to(z_t.dtype) / self.setpoint_scale.to(z_t.dtype)              # [B, d_a]
         return torch.cat([z_t, emb, setpoint], dim=-1)                                  # [B, d + d_u + d_a]
 
-    def forward_heads(self, z_t: Tensor, u_t: Tensor, a_bar: Tensor) -> Tensor:
-        """Per-head forecasts z_hat^(i)_{t+1}: ``[N_e, B, d]``. All heads read the same input."""
+    def _head_outputs(self, z_t: Tensor, u_t: Tensor, a_bar: Tensor) -> Tensor:
+        """Raw outputs of the N_e MLPs on the shared input: ``[N_e, B, d]``."""
         x = self.head_input(z_t, u_t, a_bar)                                            # [B, in]
         return self.heads(x.unsqueeze(0).expand(self.num_heads, -1, -1))                # [N_e, B, d]
+
+    def forward_heads(self, z_t: Tensor, u_t: Tensor, a_bar: Tensor) -> Tensor:
+        """Per-head forecasts z_hat^(i)_{t+1}: ``[N_e, B, d]``. All heads read the same input."""
+        out = self._head_outputs(z_t, u_t, a_bar)
+        return z_t.unsqueeze(0) + out if self.residual else out
+
+    def forward_deltas(self, z_t: Tensor, u_t: Tensor, a_bar: Tensor) -> Tensor:
+        """Residual heads: the forecast changes f^(i) = z_hat^(i)_{t+1} - z_t, ``[N_e, B, d]``."""
+        if not self.residual:
+            raise RuntimeError("forward_deltas needs residual heads (residual=True)")
+        return self._head_outputs(z_t, u_t, a_bar)
 
     @staticmethod
     def _ensemble_mean(heads: Tensor) -> Tensor:
@@ -268,6 +299,12 @@ class JEPAPredictor(nn.Module):
         Returns:
             ``PredictorOutput(z_hat [B, d], sigma [B], head_predictions [N_e, B, d])``.
         """
+        if self.residual:
+            deltas = self._head_outputs(z_t, u_t, a_bar)           # [N_e, B, d] forecast changes
+            z_hat = z_t + self._ensemble_mean(deltas)              # [B, d]
+            # Eq. 22 is invariant to adding z_t to every head: the disagreement of the changes, computed from
+            # the small changes rather than from heads of size |z_t| (no cancellation at low precision).
+            return PredictorOutput(z_hat, self.ensemble_uncertainty(deltas), z_t.unsqueeze(0) + deltas)
         heads = self.forward_heads(z_t, u_t, a_bar)                # [N_e, B, d]
         z_hat = self._ensemble_mean(heads)                         # [B, d]
         return PredictorOutput(z_hat, self.ensemble_uncertainty(heads), heads)
@@ -677,6 +714,38 @@ def _self_test() -> None:
     for i in range(1, 5):
         assert torch.equal(out_same.head_predictions[i], out_same.head_predictions[0])
     assert torch.equal(out_same.sigma, torch.zeros(b)), float(out_same.sigma.abs().max())
+
+    # ---- Residual heads: same layers and parameters, z_hat^(i) = z_t + f^(i), sigma of the changes.
+    torch.manual_seed(7)
+    plain = JEPAPredictor()
+    torch.manual_seed(7)
+    res = JEPAPredictor(residual=True)
+    assert count_parameters(res) == AERO_PREDICTOR_PARAMS and res.residual and not plain.residual
+    assert all(torch.equal(p, q) for p, q in zip(plain.parameters(), res.parameters(), strict=True))  # scale 1
+    assert sorted(res.state_dict()) == sorted(plain.state_dict())       # same checkpoint layout
+    ref_f = _ref_head_forward(plain, z_t, u_t, a_bar)                    # float64 f^(i)
+    assert _close(res.forward_heads(z_t, u_t, a_bar), z_t.double().unsqueeze(0) + ref_f, _RTOL_WIDE, _ATOL_WIDE)
+    assert torch.equal(res.forward_deltas(z_t, u_t, a_bar), plain.forward_heads(z_t, u_t, a_bar))
+    _expect(RuntimeError, lambda: plain.forward_deltas(z_t, u_t, a_bar))
+    res.set_latent_scale(gamma_star)
+    out_res = res(z_t, u_t, a_bar)
+    assert _close(out_res.z_hat, z_t.double() + ref_f.mean(dim=0), _RTOL_WIDE, _ATOL_WIDE)
+    assert _close(out_res.sigma, _ref_sigma(ref_f, gamma_star), _RTOL_WIDE, _ATOL_WIDE)    # changes only
+    assert _close(out_res.sigma, _ref_sigma(z_t.double().unsqueeze(0) + ref_f, gamma_star), _RTOL_WIDE, _ATOL_WIDE)
+    assert _close(out_res.head_predictions, res.forward_heads(z_t, u_t, a_bar))
+    torch.manual_seed(7)
+    scaled = JEPAPredictor(residual=True, residual_init_scale=0.25)        # only the output layer is scaled
+    for (name, p), q in zip(scaled.named_parameters(), plain.parameters(), strict=True):
+        assert torch.equal(p, 0.25 * q) if name.startswith(f"heads.{len(plain.heads) - 1}.") else torch.equal(p, q)
+    zero = JEPAPredictor(residual=True, residual_init_scale=0.0)          # starts exactly at persistence
+    zero.set_latent_scale(gamma_star)
+    out_zero = zero(z_t, u_t, a_bar)
+    assert torch.equal(out_zero.z_hat, z_t) and torch.equal(out_zero.sigma, torch.zeros(b))
+    zero.zero_grad(set_to_none=True)
+    (zero(z_t, u_t, a_bar).z_hat - torch.ones(b, d)).pow(2).sum().backward()
+    assert all(float(zero.heads[-1].weight.grad[i].abs().max()) > 0.0 for i in range(5))  # learns from step 0
+    for bad in (-0.1, float("nan"), float("inf")):
+        _expect(ValueError, lambda sc=bad: JEPAPredictor(residual=True, residual_init_scale=sc))
 
     # ---- Eqs. 9 and 10 against loop references (small d keeps the loops fast).
     bs, ds = 32, 8

@@ -79,6 +79,8 @@ class VPAConfig:
     predictor_hidden: int = 512                 # [P] Table 1
     predictor_hidden_layers: int = 2            # [P] Table 1
     predictor_horizon_s: float = 0.1            # [P] T_nu: "t+1" is 0.1 s ahead, not the next decision
+    predictor_residual: bool = False            # [I] residual heads: z_hat^(i) = z_t + f^(i)(...) (same parameters)
+    predictor_residual_init: float = 1.0        # [I] factor on the default init of the residual output layer
 
     # ---- JEPA training (Eqs. 8-11) ----
     vicreg_gamma: float = 1.0                   # [I] gamma
@@ -164,6 +166,10 @@ class VPAConfig:
             raise ValueError("require 0 < vicreg_eps < vicreg_gamma^2 (Eq. 9)")
         if not 0.0 <= self.ema_momentum < 1.0:
             raise ValueError("ema_momentum must lie in [0, 1)")
+        if not isinstance(self.predictor_residual, bool):
+            raise ValueError("predictor_residual must be a bool")
+        if not (math.isfinite(self.predictor_residual_init) and self.predictor_residual_init >= 0.0):
+            raise ValueError("predictor_residual_init must be finite and non-negative")
         for name in ("max_speed_h", "max_speed_z", "max_yaw_rate", "max_decel", "knot_dt", "predictor_horizon_s",
                      "goal_saturation_distance", "goal_eps", "waypoint_radius", "executor_rate_hz", "speed_eps",
                      "beta", "lambda_v"):
@@ -263,7 +269,8 @@ class VPAConfig:
             latent_dim=self.latent_dim, num_primitives=self.num_primitives, setpoint_dim=self.action_dim,
             num_heads=self.ensemble_heads, primitive_embed_dim=self.primitive_embed_dim,
             hidden_dim=self.predictor_hidden, num_hidden_layers=self.predictor_hidden_layers,
-            setpoint_scale=self.action_scale,
+            setpoint_scale=self.action_scale, residual=self.predictor_residual,
+            residual_init_scale=self.predictor_residual_init,
         )
 
     def build_vicreg_loss(self) -> Any:
@@ -355,6 +362,18 @@ def _self_test() -> None:
     pred = cfg.build_predictor()
     assert count(pred) == predictor.AERO_PREDICTOR_PARAMS == 2_720_192
     assert torch.equal(pred.setpoint_scale, torch.tensor(cfg.action_scale))
+    assert not pred.residual
+    res_cfg = VPAConfig(predictor_residual=True, predictor_residual_init=0.5)
+    res_pred = res_cfg.build_predictor()
+    assert res_pred.residual and res_pred.residual_init_scale == 0.5 and count(res_pred) == count(pred)
+    for bad in (dict(predictor_residual_init=-1.0), dict(predictor_residual_init=float("nan")),
+                dict(predictor_residual=1)):
+        try:
+            VPAConfig(**bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"accepted {bad}")
     tracker = cfg.build_latent_scale_tracker()
     tracker.update(torch.randn(64, cfg.latent_dim, generator=gen))
     gamma_star, mu_z = tracker.freeze()

@@ -43,7 +43,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, Subset
 
-from checkpoint import build_stage1_modules
+from checkpoint import build_stage1_modules, config_from_dict
 from config import VPAConfig
 from train_stage1 import _batch_images, _datasets, autocast, pick_device
 
@@ -154,7 +154,7 @@ def diagnose(args: argparse.Namespace) -> Dict[str, Dict[str, float]]:
                                include_failed=bool(saved.get("include_failed", False)))
     if not split.data:
         raise ValueError("no demonstration files: pass --data")
-    cfg = VPAConfig()
+    cfg = config_from_dict(state["config"]) if "config" in state else VPAConfig()     # older states: Table 1 heads
     encoder, predictor = build_stage1_modules(cfg)
     target = cfg.build_momentum_encoder(encoder)
     encoder.load_state_dict(state["encoder"])
@@ -184,7 +184,8 @@ def diagnose(args: argparse.Namespace) -> Dict[str, Dict[str, float]]:
         for split_name, r in results.items():
             table[split_name][name] = _sq(design(r, key, with_action) @ w, r["z_tg_next"])
     stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(args.state)))
-    print(f"stage (i) at step {int(state.get('step', -1))} (state saved {stamp}); {len(results['val']['u'])} held-out "
+    heads = "residual heads" if cfg.predictor_residual else "Table 1 heads"
+    print(f"stage (i) at step {int(state.get('step', -1))}, {heads} (state saved {stamp}); {len(results['val']['u'])} held-out "
           f"and {len(results['train']['u'])} training frames on {device}{' with bf16' if amp else ''}; "
           f"{time.time() - t0:.0f} s")
     print(f"{'':44s}{'held-out':>12s}{'training':>12s}")
@@ -226,6 +227,12 @@ def _self_test() -> None:
         m = diagnose(parse_args([out + ".same.pt", *small]))["val"]
         assert m["gap"] < 1e-9 and abs(m["copy_online"] - m["copy_target"]) < 1e-6
         assert abs(m["pred_from_target"] - m["pred_mean"]) < 1e-6
+        # residual heads: the configuration comes from the state
+        train_stage1(stage1_args([train_file, "--out", out + ".res", "--batch_size", "8", "--num_workers", "0",
+                                  "--device", "cpu", "--steps", "2", "--val_fraction", "0.34", "--log_every", "1",
+                                  "--warmup_steps", "1", "--residual_predictor"]))
+        m = diagnose(parse_args([out + ".res.state.pt", *small]))["val"]
+        assert all(np.isfinite(list(m.values()))) and m["pred_heads"] >= m["pred_mean"] - 1e-6
         # ridge regression recovers an exact linear map
         g = torch.Generator().manual_seed(0)
         x = torch.randn(200, 5, generator=g, dtype=torch.float64)

@@ -51,8 +51,8 @@ import torch.nn as nn
 from torch import Tensor
 from torch.utils.data import DataLoader, Subset
 
-from checkpoint import atomic_torch_save, build_stage1_modules, environment_info, load_checkpoint, make_checkpoint, \
-    save_checkpoint
+from checkpoint import atomic_torch_save, build_stage1_modules, config_from_dict, config_to_dict, environment_info, \
+    load_checkpoint, make_checkpoint, save_checkpoint
 from config import VPAConfig
 from dataset import AeroVPADataset, episode_split, expand_paths
 
@@ -156,6 +156,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--save_minutes", type=float, default=20.0, help="training-state save interval")
     p.add_argument("--resume", action="store_true", help="continue from <out>.state.pt")
     p.add_argument("--include_failed", action="store_true", help="also train on unsuccessful episodes")
+    p.add_argument("--residual_predictor", action="store_true",
+                   help="residual heads: z_hat^(i) = z_t + f^(i)(...), same parameters (config predictor_residual)")
+    p.add_argument("--residual_init", type=float, default=1.0,
+                   help="factor on the default init of the residual output layer (0: start at persistence)")
     p.add_argument("--self-test", dest="self_test", action="store_true", help="run the self-test and exit")
     args = p.parse_args(argv)
     if not args.self_test and not args.data:
@@ -251,7 +255,7 @@ def train_stage1(args: argparse.Namespace) -> str:
     device = pick_device(args.device)
     amp = (not args.no_amp) and device.type == "cuda"
     set_seed(args.seed)
-    cfg = VPAConfig()
+    cfg = VPAConfig(predictor_residual=bool(args.residual_predictor), predictor_residual_init=float(args.residual_init))
     log = RunLog(args.out + ".log.jsonl")
     train_ds, val_ds = _datasets(args, cfg)
     loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True,
@@ -282,6 +286,12 @@ def train_stage1(args: argparse.Namespace) -> str:
         if not os.path.isfile(state_path):
             raise FileNotFoundError(f"--resume: no training state {state_path}")
         state = torch.load(state_path, map_location=device, weights_only=True)
+        saved_cfg = config_from_dict(state["config"]) if "config" in state else VPAConfig()
+        mode = lambda c: (c.predictor_residual, c.predictor_residual_init if c.predictor_residual else None)  # noqa: E731
+        if mode(saved_cfg) != mode(cfg):
+            raise ValueError(f"--resume: {state_path} was trained with predictor_residual="
+                             f"{saved_cfg.predictor_residual} (init {saved_cfg.predictor_residual_init}); "
+                             "pass the same --residual_predictor/--residual_init")
         encoder.load_state_dict(state["encoder"])
         predictor.load_state_dict(state["predictor"])
         target.load_state_dict(state["target"])
@@ -294,12 +304,15 @@ def train_stage1(args: argparse.Namespace) -> str:
     def save_state() -> None:
         atomic_torch_save({"step": step, "encoder": encoder.state_dict(), "predictor": predictor.state_dict(),
                            "target": target.state_dict(), "tracker": tracker.state_dict(),
-                           "optimizer": optimizer.state_dict(), "args": vars(args)}, state_path)
+                           "optimizer": optimizer.state_dict(), "args": vars(args), "config": config_to_dict(cfg)},
+                          state_path)
 
     log("start", f"stage (i): {len(train_ds)} training samples from {len(train_ds.episodes)} episodes in "
         f"{len(train_ds.paths)} files; {len(val_ds) if val_ds else 0} validation samples; {total} steps of "
         f"{args.batch_size} ({total * args.batch_size / len(train_ds):.1f} epochs) on {device}"
-        f"{' with bf16' if amp else ''}", samples=len(train_ds), steps=total, device=str(device))
+        f"{' with bf16' if amp else ''}"
+        f"{f'; residual predictor (init x{cfg.predictor_residual_init:g})' if cfg.predictor_residual else ''}",
+        samples=len(train_ds), steps=total, device=str(device), predictor_residual=cfg.predictor_residual)
     encoder.train()
     predictor.train()
     last_save, t_log, wait, seen = time.time(), time.time(), 0.0, 0
@@ -435,6 +448,24 @@ def _self_test() -> None:
                                ("pos_embed", nn.Parameter(torch.zeros(1, 3, 2)))], 0.05)
         assert len(groups[0]["params"]) == 1 and len(groups[1]["params"]) == 2
         assert expand_paths(os.path.join(tmp, "*.hdf5")) == sorted([train_file, val_file])
+        # residual heads: kept in the checkpoint and state config, rebuilt downstream, guarded on --resume
+        from checkpoint import load_stage1_modules
+
+        out_r = os.path.join(tmp, "ckpt", "stage1_res.pt")
+        base_r = [arg if arg != out else out_r for arg in base]
+        train_stage1(parse_args(base_r + ["--steps", "2", "--residual_predictor", "--residual_init", "0.5"]))
+        ckpt_r = load_checkpoint(out_r, kind="stage1")
+        assert ckpt_r["config"]["predictor_residual"] is True and ckpt_r["config"]["predictor_residual_init"] == 0.5
+        assert load_stage1_modules(ckpt_r)[2].residual and not load_stage1_modules(ckpt2)[2].residual
+        assert torch.load(out_r + ".state.pt", weights_only=True)["config"]["predictor_residual"] is True
+        try:
+            train_stage1(parse_args(base_r + ["--steps", "3", "--resume"]))             # flag left out
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("--resume accepted a different predictor parameterisation")
+        train_stage1(parse_args(base_r + ["--steps", "3", "--resume", "--residual_predictor", "--residual_init", "0.5"]))
+        assert load_checkpoint(out_r, kind="stage1")["provenance"]["steps"] == 3
     print("train_stage1.py self-test passed")
 
 
