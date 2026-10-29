@@ -308,14 +308,20 @@ blind to obstacles and waypoints in flight.
 `sim/fly_policy.py --dagger_dir DIR` flies the policy and records every frame with the privileged expert's command
 for the state the vehicle is actually in (`sim/dagger.py`). The expert's reference is its minimum-snap plan of the
 mission (speed drawn per mission from 3, 5 and 7 m/s, as in the demonstrations); the label is its tracking law from
-the point of that path nearest to the vehicle, so it steers back onto the path, turns the camera to the direction
-of travel and keeps the reference speed. The expert takes over before trouble (an obstacle within 0.5 m now or in
-0.5 s, below 0.8 m, more than 1.5 m off the path, facing more than 75 degrees away from it, a missed waypoint, no
-progress for 5 s): it flies back to the path when the straight line is clear and short (still recording), and
-otherwise brakes, re-plans from where it stopped through the remaining waypoints and turns to the new path before
-flying it; after 2 s back on the path the policy flies again. Every decision runs the policy as deployed, so S_t
-holds the setpoint that was actually dispatched. Frames go to `DIR/<world>.hdf5` in the demonstration schema, one
-episode per recorded segment, so `cache_latents.py` and `train_stage2.py` read them unchanged.
+the point of that path nearest to the vehicle. On the path that is the demonstrations' law; more than 0.3 m off it
+the expert first rejoins the path (feed-forward fading out and the speed limit falling to 2 m/s at 1 m off), so the
+way back is short and slow rather than a fast run alongside the path. The expert takes over before trouble (an
+obstacle within 0.5 m along the current velocity over the reaction and braking time, below 0.8 m, more than 1.5 m
+off the path, facing more than 75 degrees away from it, a missed waypoint, no progress for 5 s). When its own
+closed loop from the current state (the tracking law with PX4's velocity response, predicted over 2 s) stays clear
+of obstacles, it flies on from where the vehicle is, still recording, also when the policy was heading for a trunk:
+on its path the expert steers round it, where a straight stop at speed would run into the next one. Otherwise, and
+after a missed waypoint, it brakes, backs away to 0.8 m from the nearest obstacle, re-plans from there through the
+remaining waypoints and turns to the new path before flying it. While the expert flies, the same prediction runs
+every 50 ms and brakes it before it would come within 0.45 m of an obstacle; after 2 s back on the path the policy
+flies again. Every decision runs the policy as deployed, so S_t holds the setpoint that was actually dispatched.
+Frames go to `DIR/<world>.hdf5` in the demonstration schema, one episode per recorded segment, so `cache_latents.py`
+and `train_stage2.py` read them unchanged.
 
 ```bash
 # one round: fly the policy over the 200 training worlds (3 simulators), cache the new latents, retrain stage (ii)
@@ -326,8 +332,11 @@ sim/dagger_round.sh --round 1 --policy checkpoints/policy_res_noact_cal_ep.pt --
 
 The round reuses the stage-(ii) settings of the flying policy (steps, batch size, learning rate, EMA, validation
 split, `policy_state_inputs`), so rounds differ only in their data; every step is resumable. `summarize_flights.py`
-reports the share of flight time under the policy, the takeovers by reason and the frames recorded per mission;
-`show_trace.py` on a traced DAgger flight (`--trace`) shows the policy's first knot against the expert's label.
+reports the share of flight time under the policy, the takeovers by reason, the frames recorded per mission, the
+expert's own brakes and who was flying at each crash; `show_trace.py` on a traced DAgger flight (`--trace`) shows the
+policy's first knot against the expert's label. `sim/stress_dagger.py` exercises the supervisor without ROS: scripted
+policies (a copycat, a noisy expert, the expert itself) fly sampled missions of generated worlds with a PX4-like
+vehicle, and it counts crashes by who was flying, re-plans, expert brakes and false alarms.
 
 ## Repository layout
 

@@ -124,8 +124,16 @@ def _dagger_stats(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         for k, v in (r.get("dagger_takeovers") or {}).items():
             reasons[k] = reasons.get(k, 0.0) + v / n
     shares = [r.get("dagger_policy_share") for r in records]
+    crash_modes: Dict[str, int] = {}
+    for r in records:
+        if r.get("termination") in ("collision", "ground"):
+            mode = str(r.get("dagger_final_mode") or "?")
+            crash_modes[mode] = crash_modes.get(mode, 0) + 1
     return {"dagger_missions": n, "dagger_policy_share": _median([x for x in shares if x is not None]),
             "dagger_takeovers": reasons, "dagger_replans": float(np.mean([r.get("dagger_replans", 0) for r in records])),
+            "dagger_expert_brakes": float(np.mean([r.get("dagger_expert_brakes", 0) for r in records])),
+            "dagger_soft_blocked": float(np.mean([r.get("dagger_soft_blocked", 0) for r in records])),
+            "dagger_crash_modes": crash_modes,
             "dagger_frames_policy": float(np.mean([r.get("dagger_frames_policy", 0) for r in records])),
             "dagger_frames_expert": float(np.mean([r.get("dagger_frames_expert", 0) for r in records]))}
 
@@ -199,6 +207,10 @@ def report(data: Dict[str, Dict[Tuple[str, int], Dict[str, Any]]], by: Optional[
             ("DAgger: frames / mission (pol/exp)", lambda st: f"{st['dagger_frames_policy']:.0f} / "
              f"{st['dagger_frames_expert']:.0f}" if "dagger_missions" in st else "-"),
             ("DAgger: re-plans / mission", lambda st: f"{st['dagger_replans']:.2f}" if "dagger_missions" in st else "-"),
+            ("  expert brakes / way back blocked", lambda st: f"{st['dagger_expert_brakes']:.2f} / "
+             f"{st['dagger_soft_blocked']:.2f}" if "dagger_missions" in st else "-"),
+            ("  crashes by who flew", lambda st: (", ".join(f"{k} {v}" for k, v in sorted(st["dagger_crash_modes"].items()))
+                                                  or "none") if "dagger_missions" in st else "-"),
         ]
     width = max(24, *(len(t) + 2 for t in tags))
     print(f"{'':34s}" + "".join(f"{t:>{width}s}" for t in tags))

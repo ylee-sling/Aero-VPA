@@ -12,27 +12,34 @@ per mission from --speed_limits (as in the demonstrations), with the yaw referen
 travel. The label of a frame is the expert's tracking law along that reference from the point nearest to the
 vehicle (progress tau*, searched from the previous one, 0.5 s back to 2 s ahead):
 
-    knot k = v_ref(tau* + k Delta) + k_p e_p exp(-k_p k Delta),   e_p = p_ref(tau*) - p_hat,
+    knot k = w v_ref(tau* + k Delta) + k_p e_p exp(-k_p k Delta),   e_p = p_ref(tau*) - p_hat,
 
 and the yaw rate likewise, saturated as the expert's commands (``ExpertController.chunk`` with its clock at tau*).
-On the expert's own flight tau* follows the clock and the label is the recorded one; off it the label steers back
-onto the path, turns the camera to the direction of travel and keeps the reference's speed.
+On the path (e = |e_p| <= rejoin_near, 0.3 m) w = 1 and the horizontal speed limit is the reference's: on the
+expert's own flight tau* follows the clock and the label is the recorded one. Off the path the expert rejoins it
+before following it: the feed-forward weight w falls linearly to 0 and the speed limit to rejoin_speed (2 m/s) at
+e >= rejoin_far (1 m), so the way back is the short, slow one towards the path rather than a fast run alongside it
+through ground the plan never cleared. The camera keeps turning to the path's direction of travel.
 
 Gate. The policy flies unless (``GateConfig``) the vehicle would come close to an obstacle (privileged clearance
 along its current velocity over the reaction time plus the braking time), sinks too low, leaves the corridor
 around the path, faces away from the path, misses its active waypoint or stops making progress. Then the expert
 takes over:
-    * off the corridor, facing away or too low, when the straight line back to the path is clear and short: it
-      flies the reference from tau* and the frames are still recorded;
-    * near an obstacle, after a missed waypoint or a stall, or when the way back is blocked or long: it brakes
-      (minimum-jerk stop), backs away from the nearest obstacle to --backoff_clearance if it stopped closer,
-      re-plans from there through the remaining waypoints, turns to the new path and flies it. Braking, backing
-      off, hovering, planning and turning are not recorded.
+    * when the way back to the path is short and stays clear of obstacles (the expert's own closed loop from the
+      current state, predicted over rollout_s, keeps the gate clearance): it flies the reference from tau* and
+      the frames are still recorded. Near an obstacle too: on its path the expert steers round what the policy
+      was heading for, where a straight stop at speed would run into the next trunk;
+    * after a missed waypoint, or when the way back is blocked or long: it brakes (minimum-jerk stop), backs away
+      from the nearest obstacle to --backoff_clearance if it stopped closer, re-plans from there through the
+      remaining waypoints, turns to the new path and flies it. Braking, backing off, hovering, planning and
+      turning are not recorded.
 The expert's clock on its reference is governed: it runs with time but never more than lead_distance (1 m) ahead
 of the path point nearest the vehicle, so after a takeover mid-path (vehicle slow, reference fast) the reference
-waits for the vehicle instead of running away and pulling it across corners. While the expert flies, a clearance
-below expert_clearance makes it brake and re-plan as well. After --recover_s on the path (within 0.5 m, heading
-within 20 degrees, clear of obstacles) the policy gets control back.
+waits for the vehicle instead of running away and pulling it across corners. While the expert flies, its own
+closed loop is predicted every check_period over the reaction time plus the braking time (``rollout``: the tracking
+law on the governed clock, a first-order velocity response with time constant response_s, as PX4's velocity loop);
+when it would come closer than expert_clearance to an obstacle, the expert brakes and re-plans as well. After
+--recover_s on the path (within 0.5 m, heading within 20 degrees, clear of obstacles) the policy gets control back.
 
 Every decision runs the policy as deployed (its chunks are only executed while it has control), so S_t carries the
 setpoint that was actually dispatched: the policy's own under its control (where a_bar and the label disagree)
@@ -61,7 +68,7 @@ import expert as E  # noqa: E402
 DAGGER_VERSION = "1.0.0"
 MODES = ("POLICY", "EXPERT", "BRAKE", "BACKOFF", "PLAN", "ALIGN")
 TRIGGERS = ("obstacle", "low", "off_path", "heading", "missed_waypoint", "stall")
-SOFT = ("low", "off_path", "heading")       # the expert flies back to the path (when the way is clear and short)
+HARD = ("missed_waypoint",)     # always brake and re-plan; after the others the expert flies on if its way is clear
 Command = Tuple[np.ndarray, np.ndarray, float]                  # NED velocity, NED acceleration, yaw rate
 PlanFn = Callable[[np.ndarray, np.ndarray, float], "Future[E.MinSnapSpline]"]
 
@@ -73,7 +80,14 @@ class GateConfig:
     clearance: float = 0.5           # predicted privileged clearance that makes the expert brake (m); the planner keeps 0.6
     lookahead_s: float = 0.5         # shortest prediction horizon (s)
     reaction_s: float = 0.3          # the prediction runs the current velocity for reaction_s + the braking time (s)
-    expert_clearance: float = 0.4    # while the expert flies its path: brake and re-plan below this clearance (m)
+    expert_clearance: float = 0.45   # while the expert flies: brake and re-plan when its predicted closed loop comes closer (m)
+    rollout_s: float = 2.0           # a soft takeover needs the expert's way back to keep `clearance` for this long (s)
+    response_s: float = 0.5          # velocity response time constant of the closed-loop prediction (s; PX4 ~ 1 / MPC_XY_VEL_P_ACC)
+    delay_s: float = 0.15            # dead time of that response: the vehicle keeps its velocity this long (s)
+    check_period: float = 0.05       # period of the closed-loop prediction while the expert flies (s)
+    rejoin_near: float = 0.3         # off the path by more than this, the expert's feed-forward fades out (m)
+    rejoin_far: float = 1.0          # ... and is gone beyond this, where the expert returns at rejoin_speed (m)
+    rejoin_speed: float = 2.0        # horizontal speed limit of the expert's way back to its path (m/s)
     backoff_clearance: float = 0.8   # after braking closer than this to an obstacle, back away to it (m)
     lead_distance: float = 1.0       # the expert's reference point runs at most this far ahead of the vehicle's (m)
     altitude: float = 0.8            # height above the home ground (m)
@@ -85,7 +99,7 @@ class GateConfig:
     label_distance: float = 2.5      # policy frames farther from the path are not recorded (m)
     correction_clearance: float = 0.4  # the straight line back to the path must keep this clearance (m)
     min_segment: int = 10            # shorter recorded segments are dropped (frames)
-    brake_decel: float = 4.0         # a_max of the minimum-jerk stop (m/s^2)
+    brake_decel: float = 5.0         # a_max of the minimum-jerk stop (m/s^2; the executor's a_max)
     max_plan_failures: int = 3
 
     def __post_init__(self) -> None:
@@ -94,19 +108,30 @@ class GateConfig:
                 raise ValueError(f"GateConfig.{name} must be a non-negative number, got {value}")
         if self.replan_distance < self.distance or self.brake_decel <= 0:
             raise ValueError("require replan_distance >= distance and brake_decel > 0")
+        if self.rejoin_far <= self.rejoin_near or self.rejoin_speed <= 0 or self.response_s <= 0:
+            raise ValueError("require rejoin_far > rejoin_near, rejoin_speed > 0 and response_s > 0")
 
 
 class Reference:
-    """An expert reference trajectory and the vehicle's progress tau* along it."""
+    """An expert reference trajectory, the vehicle's progress tau* along it, and the expert's law off it.
+
+    ``rejoin`` = (near, far, speed): off the path by e, the law's feed-forward has weight w = 1 up to ``near``,
+    falling linearly to 0 at ``far``, and its horizontal speed limit falls likewise from the reference's to
+    ``speed`` (see the module docstring)."""
 
     def __init__(self, trajectory: E.ExpertTrajectory, speed: float, waypoints: np.ndarray, first_waypoint: int = 1,
-                 dt: float = 0.02) -> None:
+                 dt: float = 0.02, rejoin: Tuple[float, float, float] = (0.3, 1.0, 2.0)) -> None:
         self.trajectory = trajectory
         self.speed = float(speed)
         self.limits = E.CommandLimits(speed_h=self.speed)
+        self.dt = float(dt)
         n = int(math.ceil(trajectory.duration / dt)) + 1
         self.ts = np.minimum(np.arange(n) * dt, trajectory.duration)
         self.ps = trajectory.spline.evaluate(self.ts)
+        self.vs = trajectory.spline.evaluate(self.ts, 1)
+        self.accs = trajectory.spline.evaluate(self.ts, 2)
+        self.rejoin_near, self.rejoin_far, self.rejoin_speed = (float(r) for r in rejoin)
+        self.k_pos = E.ExpertController(trajectory, 0.0, self.limits).k_pos
         self.tau = 0.0
         # reference time at which the path passes each waypoint it covers (1-based mission indices)
         self.waypoint_times: Dict[int, float] = {
@@ -117,9 +142,11 @@ class Reference:
     def duration(self) -> float:
         return self.trajectory.duration
 
-    def nearest(self, position: np.ndarray, back: float = 0.5, ahead: float = 2.0) -> float:
-        """tau* of ``position``: the closest sample within [tau - back, tau + ahead] of the current progress."""
-        idx = np.nonzero((self.ts >= self.tau - back) & (self.ts <= self.tau + ahead))[0]
+    def nearest(self, position: np.ndarray, back: float = 0.5, ahead: float = 2.0, center: Optional[float] = None) -> float:
+        """tau* of ``position``: the closest sample within [c - back, c + ahead] of the current progress c (or of
+        ``center``)."""
+        c = self.tau if center is None else float(center)
+        idx = np.nonzero((self.ts >= c - back) & (self.ts <= c + ahead))[0]
         if idx.size == 0:
             idx = np.array([len(self.ts) - 1])
         d = np.linalg.norm(self.ps[idx] - np.asarray(position, dtype=np.float64), axis=1)
@@ -128,6 +155,32 @@ class Reference:
     def advance(self, position: np.ndarray) -> float:
         self.tau = self.nearest(position)
         return self.tau
+
+    def offset(self, position: np.ndarray, tau: Optional[float] = None) -> float:
+        """Distance from ``position`` to the path point at ``tau`` (default: its own tau*, searched around tau)."""
+        tau = self.nearest(position) if tau is None else float(tau)
+        return float(np.linalg.norm(self.position(tau) - np.asarray(position, dtype=np.float64)))
+
+    def blend(self, e: float) -> Tuple[float, float]:
+        """(feed-forward weight w, horizontal speed limit) of the expert's law at distance ``e`` from its path."""
+        if e <= self.rejoin_near:
+            return 1.0, self.speed
+        w = max(0.0, (self.rejoin_far - float(e)) / (self.rejoin_far - self.rejoin_near))
+        slow = min(self.rejoin_speed, self.speed)
+        return w, slow + w * (self.speed - slow)
+
+    def command(self, now: float, tau: float, position: np.ndarray, yaw: float, e: float) -> Command:
+        """The expert's setpoint (NED velocity, NED acceleration, yaw rate) with its clock at ``tau``, ``e`` off the
+        path (on the path: ``ExpertController.command``)."""
+        w, vmax = self.blend(e)
+        ctrl = self.controller(now, tau)
+        if w >= 1.0:
+            return ctrl.command(now, position, yaw)
+        p, v, a, yaw_ref, rate = self.trajectory.reference(float(tau))
+        vel = w * v + ctrl.k_pos * (p - np.asarray(position, dtype=np.float64))
+        yr = rate + ctrl.k_yaw * E.wrap_angle(yaw_ref - yaw)
+        vel, yr = E.CommandLimits(speed_h=vmax).apply(vel, np.asarray(yr))
+        return vel, w * a, float(yr)
 
     def lead_time(self, tau: float, distance: float, horizon: int = 500) -> float:
         """The first reference time after ``tau`` at which the path lies ``distance`` (straight line) from p_ref(tau),
@@ -147,9 +200,22 @@ class Reference:
         """The expert's tracking law whose clock reads ``tau`` at time ``now``."""
         return E.ExpertController(self.trajectory, float(now) - float(tau), self.limits)
 
-    def label(self, stamp: float, tau: float, position: np.ndarray, yaw: float) -> np.ndarray:
-        """The expert's chunk ``[H, 4]`` (heading frame of ``yaw``) from progress ``tau``."""
-        return self.controller(stamp, tau).chunk(stamp, position, yaw)
+    def label(self, stamp: float, tau: float, position: np.ndarray, yaw: float, e: Optional[float] = None) -> np.ndarray:
+        """The expert's chunk ``[H, 4]`` (heading frame of ``yaw``) from progress ``tau``, ``e`` off the path (default:
+        the distance to the nearest path point)."""
+        ctrl = self.controller(stamp, tau)
+        w, vmax = self.blend(self.offset(position) if e is None else e)
+        if w >= 1.0:
+            return ctrl.chunk(stamp, position, yaw)
+        s = np.arange(E.HORIZON) * E.KNOT_DT
+        p0, _, _, yaw0, _ = self.trajectory.reference(float(tau))
+        e_p = p0 - np.asarray(position, dtype=np.float64)
+        e_y = float(E.wrap_angle(yaw0 - yaw))
+        _, v, _, _, rate = self.trajectory.reference(float(tau) + s)
+        vel = w * v + ctrl.k_pos * np.exp(-ctrl.k_pos * s)[:, None] * e_p[None]
+        yr = rate + ctrl.k_yaw * np.exp(-ctrl.k_yaw * s) * e_y
+        vel, yr = E.CommandLimits(speed_h=vmax).apply(vel, yr)
+        return np.concatenate([E.world_to_heading(vel, yaw), yr[:, None]], axis=1).astype(np.float32)
 
 
 def braking(v0: np.ndarray, elapsed: float, decel: float) -> Tuple[np.ndarray, np.ndarray, float]:
@@ -248,13 +314,15 @@ class DaggerSupervisor:
         self.episode_attrs = dict(episode_attrs or {})
         self.gate = gate or GateConfig()
         self.thresholds = E.LabelThresholds()
-        self.reference = Reference(trajectory, self.speed, self.waypoints, 1)
+        self.reference = self._reference(trajectory, 1)
         self.next_reference: Optional[Reference] = None
         self.mode, self.mode_since = "POLICY", float(start_time)
         self.tau_cmd = 0.0                                   # the expert's governed clock on its reference
+        self.last_check = -math.inf                          # last closed-loop prediction while the expert flies
         self.hold: Optional[E.ExpertController] = None
         self.backoff_z = 0.0
         self.expert_brakes = 0
+        self.soft_blocked = 0
         self.backoffs = 0
         self.brake_v0, self.brake_t0 = np.zeros(3), float(start_time)
         self.plan_future: Optional[Future] = None
@@ -272,6 +340,11 @@ class DaggerSupervisor:
         self.replans = 0
 
     # ---------------- helpers ----------------
+    def _reference(self, trajectory: E.ExpertTrajectory, first_waypoint: int) -> Reference:
+        g = self.gate
+        return Reference(trajectory, self.speed, self.waypoints[first_waypoint - 1:], first_waypoint,
+                         rejoin=(g.rejoin_near, g.rejoin_far, g.rejoin_speed))
+
     def _set_mode(self, mode: str, now: float) -> None:
         self.mode, self.mode_since = mode, float(now)
 
@@ -290,14 +363,66 @@ class DaggerSupervisor:
         if tau >= self.progress_tau + 0.25 or dist <= self.progress_dist - 0.25:
             self.progress_time, self.progress_tau, self.progress_dist = float(now), tau, dist
 
+    def horizon(self, speed: float) -> float:
+        """Prediction horizon at ``speed``: the reaction time plus the minimum-jerk braking time (at least lookahead_s)."""
+        g = self.gate
+        return max(g.lookahead_s, g.reaction_s + 1.5 * float(speed) / g.brake_decel)
+
     def predicted_clearance(self, position: np.ndarray, velocity: np.ndarray) -> float:
-        """Smallest privileged clearance along the current velocity over the reaction time plus the braking time."""
+        """Smallest privileged clearance along the current velocity over the reaction time plus the braking time
+        (sampled every 0.1 m)."""
         if not len(self.world):
             return math.inf
-        g = self.gate
-        horizon = max(g.lookahead_s, g.reaction_s + 1.5 * float(np.linalg.norm(velocity)) / g.brake_decel)
-        ts = np.linspace(0.0, horizon, 6)
+        speed = float(np.linalg.norm(velocity))
+        horizon = self.horizon(speed)
+        ts = np.linspace(0.0, horizon, max(6, int(math.ceil(horizon * speed / 0.1)) + 1))
         return float(np.min(self.world.distance(position[None] + ts[:, None] * velocity[None])))
+
+    def rollout(self, position: np.ndarray, velocity: np.ndarray, tau_cmd: float, horizon: float,
+                dt: float = 0.05) -> np.ndarray:
+        """Positions ``[N + 1, 3]`` (every ``dt`` over ``horizon``) of the vehicle under the expert's law from
+        ``position`` and ``velocity`` with its clock at ``tau_cmd``: the governed clock, the rejoin blend, and,
+        after a dead time of delay_s at the current velocity, a first-order response to the setpoint plus the
+        reference's feed-forward acceleration (time constant response_s horizontally, half of it vertically;
+        horizontal acceleration at most 1 g)."""
+        ref, g = self.reference, self.gate
+        pos = np.array(position, dtype=np.float64)
+        vel = np.array(velocity, dtype=np.float64)
+        tc = np.array([g.response_s, g.response_s, 0.5 * g.response_s])
+        last = len(ref.ts) - 1
+        tau_s, tau_c = ref.tau, float(tau_cmd)
+        n = max(1, int(math.ceil(horizon / dt)))
+        dead = int(round(g.delay_s / dt))
+        out = np.empty((n + 1, 3))
+        out[0] = pos
+        for i in range(n):
+            if i < dead:                                     # the setpoint has not reached the vehicle yet
+                pos = pos + dt * vel
+                out[i + 1] = pos
+                continue
+            tau_s = ref.nearest(pos, center=tau_s)
+            tau_c = max(tau_s, min(tau_c + dt, ref.lead_time(tau_s, g.lead_distance)))
+            j = min(int(round(tau_c / ref.dt)), last)
+            w, vmax = ref.blend(float(np.linalg.norm(ref.ps[min(int(round(tau_s / ref.dt)), last)] - pos)))
+            cmd = w * ref.vs[j] + ref.k_pos * (ref.ps[j] - pos)
+            h = math.hypot(cmd[0], cmd[1])
+            if h > vmax:
+                cmd[:2] *= vmax / h
+            cmd[2] = min(max(cmd[2], -ref.limits.climb), ref.limits.descend)
+            acc = w * ref.accs[j] + (cmd - vel) / tc
+            h = math.hypot(acc[0], acc[1])
+            if h > E.GRAVITY:
+                acc[:2] *= E.GRAVITY / h
+            vel = vel + dt * acc
+            pos = pos + dt * vel
+            out[i + 1] = pos
+        return out
+
+    def rollout_clearance(self, position: np.ndarray, velocity: np.ndarray, tau_cmd: float, horizon: float) -> float:
+        """Smallest privileged clearance along ``rollout``."""
+        if not len(self.world):
+            return math.inf
+        return float(np.min(self.world.distance(self.rollout(position, velocity, tau_cmd, horizon))))
 
     def away(self, position: np.ndarray, h: float = 0.05) -> np.ndarray:
         """Unit horizontal direction away from the nearest obstacle (central differences of the distance field)."""
@@ -364,15 +489,26 @@ class DaggerSupervisor:
             self.takeovers[reason] += 1
             ref = self.reference
             p_ref = ref.position(ref.tau)
-            if reason in SOFT and float(np.linalg.norm(p_ref - p)) <= g.replan_distance and self._clear(p, p_ref):
-                self.tau_cmd = ref.tau
+            soft = reason not in HARD and float(np.linalg.norm(p_ref - p)) <= g.replan_distance and self._clear(p, p_ref)
+            if soft and self.rollout_clearance(p, v, ref.tau, max(g.rollout_s, self.horizon(
+                    max(float(np.linalg.norm(v)), ref.speed)))) < g.clearance:
+                soft = False                                 # the way back would pass an obstacle: re-plan instead
+                self.soft_blocked += 1
+            if soft:
+                self.tau_cmd, self.last_check = ref.tau, now
                 self._set_mode("EXPERT", now)
             else:
                 self._start_brake(now, v, reason)
         if self.mode == "EXPERT":
             ref = self.reference
             self.tau_cmd = max(ref.tau, min(self.tau_cmd + dt, ref.lead_time(ref.tau, g.lead_distance)))
-            if self._clearance(p) < g.expert_clearance:
+            e = float(np.linalg.norm(ref.position(ref.tau) - p))
+            danger = False
+            if now - self.last_check >= g.check_period - 1e-9:
+                self.last_check = now
+                horizon = self.horizon(max(float(np.linalg.norm(v)), ref.blend(e)[1]))
+                danger = self.rollout_clearance(p, v, self.tau_cmd, horizon) < g.expert_clearance
+            if danger:
                 self.expert_brakes += 1
                 self._start_brake(now, v, "obstacle while the expert flies")
             elif now - self.mode_since >= g.recover_s and self._on_track(p, yaw):
@@ -380,7 +516,7 @@ class DaggerSupervisor:
                 self._set_mode("POLICY", now)
                 return None
             else:
-                return ref.controller(now, self.tau_cmd).command(now, p, yaw)
+                return ref.command(now, self.tau_cmd, p, yaw, e)
         if self.mode == "BRAKE":
             vel, acc, t_b = braking(self.brake_v0, now - self.brake_t0, g.brake_decel)
             if now - self.brake_t0 < t_b or float(np.linalg.norm(v)) > 0.3:
@@ -411,7 +547,7 @@ class DaggerSupervisor:
                 trajectory = E.ExpertTrajectory(spline, yaw)
                 heading = trajectory.initial_heading()
                 first = min(max(self.m, 1), len(self.waypoints))
-                self.next_reference = Reference(trajectory, self.speed, self.waypoints[first - 1:], first)
+                self.next_reference = self._reference(trajectory, first)
                 self.hold = E.ExpertController(self.planner.hold(self.plan_start, yaw,
                                                                  yaw_target=heading if heading is not None else yaw),
                                                now, E.CommandLimits(speed_h=1.0))
@@ -424,7 +560,7 @@ class DaggerSupervisor:
                 self.reference.tau, self.tau_cmd = 0.0, 0.0
                 self.progress_time, self.progress_tau, self.progress_dist = now, 0.0, math.inf
                 self._set_mode("EXPERT", now)
-                return self.reference.controller(now, 0.0).command(now, p, yaw)
+                return self.reference.command(now, 0.0, p, yaw, self.reference.offset(p, 0.0))
             return self.hold.command(now, p, yaw)
         return None
 
@@ -506,11 +642,12 @@ class DaggerSupervisor:
         return {"dagger_frames_policy": self.frames["policy"], "dagger_frames_expert": self.frames["expert"],
                 "dagger_frames_skipped": self.frames["skipped"], "dagger_frames_discarded": self.frames["discarded"],
                 "dagger_segments": self.segments, "dagger_replans": self.replans,
-                "dagger_expert_brakes": self.expert_brakes, "dagger_backoffs": self.backoffs,
+                "dagger_expert_brakes": self.expert_brakes, "dagger_soft_blocked": self.soft_blocked,
+                "dagger_backoffs": self.backoffs,
                 "dagger_takeovers": {k: int(self.takeovers.get(k, 0)) for k in TRIGGERS},
                 "dagger_time_s": {m: round(float(self.time_in.get(m, 0.0)), 2) for m in MODES},
                 "dagger_policy_share": float(self.time_in.get("POLICY", 0.0) / total) if total > 0 else None,
-                "dagger_speed_limit": self.speed, "dagger_failed": self.failed}
+                "dagger_speed_limit": self.speed, "dagger_failed": self.failed, "dagger_final_mode": self.mode}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -549,9 +686,20 @@ def _self_test() -> None:
     assert set(ref.waypoint_times) == {1, 2} and ref.waypoint_times[1] < ref.waypoint_times[2] <= ref.duration + 1e-9
     ref.tau = 3.0
     p_on, yaw_on = trajectory.reference(3.0)[0], float(trajectory.reference(3.0)[3])
-    off = p_on + np.array([-math.sin(yaw_on), math.cos(yaw_on), 0.0])            # 1 m to the right of the path
+    right = np.array([-math.sin(yaw_on), math.cos(yaw_on), 0.0])
+    near = p_on + 0.2 * right                                                     # on the path: the expert's chunk
+    assert np.allclose(ref.label(0.0, ref.nearest(near), near, yaw_on),
+                       ref.controller(0.0, ref.nearest(near)).chunk(0.0, near, yaw_on))
+    half = p_on + 0.5 * right                                                     # rejoining: onwards and back left
+    lab = ref.label(0.0, ref.nearest(half), half, yaw_on)
+    w_half = ref.blend(0.5)[0]
+    assert 0.0 < w_half < 1.0 and lab[0, 1] < -0.5 and float(np.linalg.norm(lab[0, :2])) <= ref.blend(0.5)[1] + 1e-5
+    assert abs(lab[0, 0] - w_half * float(np.linalg.norm(trajectory.reference(ref.nearest(half))[1][:2]))) < 0.1
+    off = p_on + 1.2 * right                                                      # 1.2 m off: straight back at 2 m/s
     lab = ref.label(0.0, ref.nearest(off), off, yaw_on)
-    assert lab[0, 1] < -1.0 and lab[0, 0] > 0.5    # the first knot points back left (heading frame) and onwards
+    assert lab[0, 1] < -1.0 and abs(lab[0, 0]) < 0.3 and float(np.linalg.norm(lab[0, :2])) <= 2.0 + 1e-5
+    cmd = ref.command(0.0, ref.nearest(off), off, yaw_on, ref.offset(off))
+    assert np.allclose(E.world_to_heading(cmd[0], yaw_on), lab[0, :3], atol=1e-5) and not np.any(cmd[1])
 
     # ---- gate: a scripted policy drifts sideways; the expert takes over, flies back, and hands back
     with tempfile.TemporaryDirectory() as tmp:
@@ -656,12 +804,13 @@ def _self_test() -> None:
     assert lead <= 1.0 + 0.2, lead
     assert max(float(np.linalg.norm(c[0])) for c in cmds) <= 7.0 * math.sqrt(2) + 2.0           # saturated, not runaway
 
-    # ---- head-on at a trunk: the prediction brakes in time, backs off if close, re-plans; no collision
+    # ---- head-on at a trunk: the expert takes over and steers round it on its path (no stop needed)
     trunk = E.PrivilegedMap([E.Obstacle("cylinder", (6.0, 0.0, -3.0), radius=0.3, half_height=3.0)])
     tplanner = E.ExpertPlanner(trunk)
     goal = np.array([[12.0, 0.0, -2.5]])
     sup = DaggerSupervisor(trunk, tplanner, goal, 3.0, tplanner.plan(start, goal, 3.0, 0.0), 0.0,
-                           lambda s, w, v: plan_now(tplanner, s, w, v), None, {}, GateConfig(distance=10.0, replan_distance=10.0))
+                           lambda s, w, v: plan_now(tplanner, s, w, v), None, {},
+                           GateConfig(distance=10.0, replan_distance=10.0, recover_s=1e9))
     vehicle = E.KinematicQuadrotor(start, 0.0)
     seen, closest, t = [], math.inf, 0.0
     for _ in range(4000):
@@ -671,11 +820,11 @@ def _self_test() -> None:
         vehicle.step(0.01, vel, acc, yr)
         closest = min(closest, float(trunk.distance(vehicle.p)))
         t += 0.01
-        if sup.mode == "EXPERT" and "BRAKE" in seen:
+        if vehicle.p[0] > 8.0:
             break
-    order = [m for i, m in enumerate(seen) if (i == 0 or seen[i - 1] != m) and m != "PLAN"]   # planning is instant
-    assert sup.takeovers["obstacle"] == 1 and order == ["POLICY", "BRAKE", "ALIGN", "EXPERT"], order
-    assert sup.replans == 1 and closest > 1.0, closest                    # braked well before the trunk
+    order = [m for i, m in enumerate(seen) if i == 0 or seen[i - 1] != m]
+    assert sup.takeovers["obstacle"] == 1 and order == ["POLICY", "EXPERT"] and sup.replans == 0, order
+    assert closest > 0.5, closest
     # stopped close to the trunk: back away before planning (the planner needs 0.6 m at the start)
     sup = DaggerSupervisor(trunk, tplanner, goal, 3.0, tplanner.plan(start, goal, 3.0, 0.0), 0.0,
                            lambda s, w, v: plan_now(tplanner, s, w, v), None, {}, GateConfig())
@@ -692,12 +841,63 @@ def _self_test() -> None:
             break
     assert sup.backoffs == 1 and float(trunk.distance(sup.plan_start)) >= 0.8 - 1e-6 and sup.replans == 1
 
-    # ---- the expert itself too close (tracking error near a trunk): brake and re-plan
+    # ---- the expert itself heading for a trunk (momentum, tracking error): its predicted closed loop brakes it
+    # while the trunk is still 0.7 m away
     sup = DaggerSupervisor(trunk, tplanner, goal, 3.0, tplanner.plan(start, goal, 3.0, 0.0), 0.0,
                            lambda s, w, v: plan_now(tplanner, s, w, v), None, {}, GateConfig())
     sup._set_mode("EXPERT", 0.0)
-    assert sup.control(0.01, np.array([5.35, 0.0, -2.5]), np.array([1.0, 0.0, 0.0]), 0.0) is not None
+    assert sup.control(0.01, np.array([5.0, 0.0, -2.5]), np.array([2.0, 0.0, 0.0]), 0.0) is not None
     assert sup.mode == "BRAKE" and sup.expert_brakes == 1 and sup.summary()["dagger_expert_brakes"] == 1
+
+    # ---- the closed-loop prediction follows the expert's own path (no false alarm on it)
+    sup = DaggerSupervisor(world, planner, waypoints, 3.0, E.ExpertTrajectory(trajectory.spline, 0.0), 0.0, plan,
+                           None, {}, GateConfig())
+    for t0 in (1.0, 4.0, 7.5):
+        sup.reference.tau, sup.tau_cmd = t0, t0
+        p0, v0 = trajectory.reference(t0)[0], trajectory.reference(t0)[1]
+        pts = sup.rollout(p0, v0, t0, 2.0)
+        dev = [float(np.min(np.linalg.norm(sup.reference.ps - q, axis=1))) for q in pts]
+        assert max(dev) < 0.1, (t0, max(dev))
+
+    # ---- soft takeover whose way back crosses a trunk: re-plan instead; the expert never gets close to it
+    side = E.PrivilegedMap([E.Obstacle("cylinder", (4.3, 1.0, -3.0), radius=0.3, half_height=3.0)])
+    splanner = E.ExpertPlanner(side)
+    sgoal = np.array([[12.0, 0.0, -2.5]])
+    sup = DaggerSupervisor(side, splanner, sgoal, 3.0, splanner.plan(start, sgoal, 3.0, 0.0), 0.0,
+                           lambda s, w, v: plan_now(splanner, s, w, v), None, {}, GateConfig())
+    sup.reference.tau = sup.reference.nearest(np.array([3.0, 2.0, -2.5]), back=0.0, ahead=10.0)
+    vehicle = E.KinematicQuadrotor(np.array([3.0, 2.0, -2.5]), 0.0, tau_v=0.5)
+    vehicle.v = np.array([2.0, 0.0, 0.0])                             # 2 m beside the path, flying parallel to it
+    assert sup.predicted_clearance(vehicle.p, vehicle.v) >= 0.5      # no obstacle ahead of it ...
+    assert sup._clear(vehicle.p, sup.reference.position(sup.reference.tau))   # ... nor on the line back
+    seen, closest, t = [], math.inf, 0.0
+    for _ in range(1500):
+        cmd = sup.control(t, vehicle.p, vehicle.v, vehicle.yaw)
+        seen.append(sup.mode)
+        vehicle.step(0.01, *(cmd if cmd is not None else (vehicle.v.copy(), np.zeros(3), 0.0)))
+        closest = min(closest, float(side.distance(vehicle.p)))
+        t += 0.01
+        if sup.mode == "EXPERT" and "BRAKE" in seen:
+            break
+    assert sup.takeovers["off_path"] == 1 and sup.soft_blocked == 1 and seen[0] == "BRAKE", (sup.takeovers, seen[:3])
+    assert sup.replans == 1 and closest > 0.5, closest
+
+    # ---- the expert flies a forest mission on its own (hand-back disabled): no brake, no re-plan
+    forest = E.synthetic_forest(seed=2)
+    fplanner = E.ExpertPlanner(forest)
+    fgoal = np.array([[20.0, 14.0, -3.0]])
+    ftraj = fplanner.plan(start, fgoal, 5.0, 0.0)
+    sup = DaggerSupervisor(forest, fplanner, fgoal, 5.0, ftraj, 0.0, lambda s, w, v: plan_now(fplanner, s, w, v),
+                           None, {}, GateConfig(recover_s=1e9))
+    sup._set_mode("EXPERT", 0.0)
+    vehicle = E.KinematicQuadrotor(start, float(ftraj.initial_heading() or 0.0), tau_v=0.3)
+    t, closest = 0.0, math.inf
+    while t < ftraj.duration + 3.0:
+        vehicle.step(0.01, *sup.control(t, vehicle.p, vehicle.v, vehicle.yaw))
+        closest = min(closest, float(forest.distance(vehicle.p)))
+        t += 0.01
+    assert sup.mode == "EXPERT" and sup.expert_brakes == 0 and sup.replans == 0, sup.summary()
+    assert float(np.linalg.norm(vehicle.p - fgoal[0])) < 0.5 and closest > 0.5, (vehicle.p, closest)
     print("dagger.py self-test passed")
 
 
