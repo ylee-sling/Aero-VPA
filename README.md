@@ -115,6 +115,10 @@ python cache_latents.py --self-test
 python train_stage2.py --self-test
 python calibrate_sigma.py --self-test   # the whole chain on dry-run data, checked against the closed loop
 python diagnose_stage1.py --self-test
+python probe_depth.py --self-test
+python clearance.py
+python sim/fly_policy.py --self-test   # dry-run flights with an untrained policy
+python sim/summarize_flights.py --self-test
 
 # the release checks: headers, licence files, citation metadata, lint and all self-tests
 python scripts/check_release.py --run-tests
@@ -238,6 +242,33 @@ python calibrate_sigma.py checkpoints/policy.pt "data_val/*.hdf5"
   --method episode_max --out checkpoints/policy_cal.pt`.
 * Dataset aggregation, stage (iii) of Sec. 3.8 (DAgger), needs a closed-loop policy node in SITL and is the next step.
 
+## Phase 3: closed-loop evaluation in SITL
+
+`sim/fly_policy.py` flies a calibrated policy checkpoint through Algorithm 1 as deployed: one decision per RGB-D
+frame through `pipeline.VPAInferencePipeline`, with the depth range d_t of the braking envelope from
+`clearance.py` (Sec. 3.6), and the 100 Hz executor dispatching PX4 velocity setpoints. Mission k of a world is
+sampled from the seed (world number, k) at the nominal home, so every policy flies the same missions; the vehicle
+turns to the expert's initial heading before the policy takes over and is flown home by the privileged expert
+after each mission. One JSON record per mission: outcome (success, collision, ground, out_of_bounds, timeout,
+camera_timeout), duration against the expert reference, path length, speeds, smallest clearance, fallback
+decisions and onsets, blind decisions, sigma_bar, the speed scale s_t, primitive counts, decision compute time and
+decision age (capture to commit). A collision ends the run with exit status 3 after the record is written.
+
+```bash
+# test worlds, disjoint from training (seeds 0-199) and calibration (1000-1011)
+python3 sim/make_world.py --seed 2000 --count 12 --density sparse medium dense --out sim/worlds/test
+# each policy over the test worlds, 10 missions per world (resumable; one stack per sweep)
+sim/evaluate_worlds.sh --instance 0 --results flights.jsonl checkpoints/policy_cal_ep.pt sim/worlds/test/*.sdf
+sim/evaluate_worlds.sh --instance 1 --results flights.jsonl checkpoints/policy_res_cal_ep.pt sim/worlds/test/*.sdf
+python3 sim/summarize_flights.py flights.jsonl --by density      # paired comparison of the two policies
+# what the stage-(i) latents keep of the obstacle geometry (linear probes on held-out flights)
+python3 probe_depth.py checkpoints/stage1.pt checkpoints/stage1_res.pt
+```
+
+`--dry_run` flies the same protocol in the kinematic model with the ray-cast camera (no ROS); its images differ
+from Gazebo's, so it checks the plumbing rather than the policy. Dataset aggregation (DAgger, stage iii) will
+record these flights with expert labels.
+
 ## Repository layout
 
 | File | Paper | Contents |
@@ -252,12 +283,17 @@ python calibrate_sigma.py checkpoints/policy.pt "data_val/*.hdf5"
 | `inspect_hdf5.py` | Secs. 3.1-3.4 | prints a demonstration file and validates it against `VPAConfig` |
 | `checkpoint.py` | Secs. 3.5, 3.8 | one-file checkpoints (config, networks, frozen statistics, provenance) |
 | `train_stage1.py` | Secs. 3.2, 3.8, Eqs. 8-11 | stage (i): E_psi and P_omega with VICReg, EMA target and gamma tracking |
+| `probe_depth.py` | Sec. 3.2 | linear probes of obstacle geometry in z_t (forward depth, depth grid, nearest obstacle) |
+| `clearance.py` | Sec. 3.6, Eqs. 27-28 | depth range d_t of the braking envelope from one depth image |
 | `diagnose_stage1.py` | Sec. 3.2, Eq. 8 | splits the stage-(i) prediction error into predictor error and EMA-target lag |
 | `cache_latents.py` | Sec. 3.8 | z_t, z_hat_{t+1} and sigma_{t+1} of the frozen stage-(i) networks per frame |
 | `train_stage2.py` | Secs. 3.3, 3.4, 3.8, Eq. 30 | stage (ii): selector, CFM solver and null instruction embedding |
 | `calibrate_sigma.py` | Sec. 3.5, Eq. 23 | sigma_lo and sigma_crit from validation flights, written into the checkpoint |
 | `sim/expert.py` | Secs. 3.1, 3.3, 5.1 | privileged expert (A*, minimum snap), labels, HDF5 schema, dry run |
 | `sim/collect_expert_dataset.py` | Secs. 4.3, 5.1 | ROS 2 collector: offboard flights, RGB-D/odometry pairing, HDF5 |
+| `sim/fly_policy.py` | Algorithm 1, Sec. 5 | closed-loop policy flights in SITL (or a dry run), one JSON record per mission |
+| `sim/evaluate_worlds.sh` | Sec. 5 | resumable policy evaluation over many worlds |
+| `sim/summarize_flights.py` | Sec. 5 | success rates, failure modes and paired comparison of policies |
 | `sim/collect_worlds.sh` | Sec. 5.1 | resumable sweep over many worlds: restarts, appends, skips complete worlds |
 | `sim/run_headless_sitl.sh` | Secs. 4.3, 5.1 | headless gz + PX4 SITL + uXRCE-DDS + ros_gz_bridge, with clean shutdown |
 | `sim/make_world.py`, `sim/models/` | Sec. 5.1 | E1 forest worlds with privileged maps; the `x500_vpa` RGB-D vehicle |

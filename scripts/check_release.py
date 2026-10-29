@@ -56,7 +56,8 @@ GPL3_LINES = 674
 SELF_TESTS = ("config.py", "perception.py", "predictor.py", "selector.py", "solver.py", "pipeline.py",
               "checkpoint.py", "sim/expert.py", "dataset.py", "train_stage1.py --self-test",
               "cache_latents.py --self-test", "train_stage2.py --self-test", "calibrate_sigma.py --self-test",
-              "diagnose_stage1.py --self-test")
+              "diagnose_stage1.py --self-test", "probe_depth.py --self-test", "clearance.py",
+              "sim/fly_policy.py --self-test", "sim/summarize_flights.py --self-test")
 LINT_COMMAND = ("ruff", "check", "--select", "F,E9,B,PLE,PLW", ".")
 EXPECTED_FILES = (
     *(command.split()[0] for command in SELF_TESTS),
@@ -75,6 +76,7 @@ EXPECTED_FILES = (
     "inspect_hdf5.py",
     "sim/collect_expert_dataset.py",
     "sim/collect_worlds.sh",
+    "sim/evaluate_worlds.sh",
     "sim/make_world.py",
     "sim/run_headless_sitl.sh",
     "sim/models/aero_vpa_rgbd/model.config",
