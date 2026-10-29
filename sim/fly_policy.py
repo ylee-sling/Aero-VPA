@@ -240,12 +240,7 @@ class Mission:
     def _trace_row(self, stamp: float, position: np.ndarray, velocity: np.ndarray, yaw: float, q: np.ndarray,
                    rates: np.ndarray, state: torch.Tensor, out: Any, reading: Any) -> Dict[str, Any]:
         """One decision of the --trace file (rounded; angles in degrees, frames as named)."""
-        def r(x: Any, n: int = 3) -> Any:
-            if x is None:
-                return None
-            a = np.asarray(x, dtype=np.float64)
-            return round(float(a), n) if a.ndim == 0 else [round(float(v), n) for v in a.ravel()]
-
+        r = _rounded
         m = int(out.waypoint_index[0])
         wp = self.waypoints[min(max(m, 1), len(self.waypoints)) - 1]
         gravity = E.gravity_in_body(q)
@@ -348,6 +343,16 @@ class Mission:
             "decision_age_ms": _stats_ms(self.age), "max_setpoint_gap_s": self.max_setpoint_gap,
             "dropped_frames": self.dropped_frames, "wall_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
+
+
+def _rounded(x: Any, n: int = 3) -> Any:
+    """A number or an array (NumPy, or a torch tensor on any device) as rounded Python floats for JSON."""
+    if x is None:
+        return None
+    if isinstance(x, torch.Tensor):
+        x = x.detach().to("cpu", torch.float64).numpy()
+    a = np.asarray(x, dtype=np.float64)
+    return round(float(a), n) if a.ndim == 0 else [round(float(v), n) for v in a.ravel()]
 
 
 def append_record(path: str, record: Dict[str, Any]) -> None:
@@ -875,6 +880,9 @@ def _self_test() -> None:
 
     from summarize_flights import load, report
 
+    # trace values: tensors NumPy cannot read directly (requires_grad here, CUDA on a GPU) are copied first
+    assert _rounded(torch.tensor([1.23456, 2.0], requires_grad=True), 2) == [1.23, 2.0]
+    assert _rounded(torch.tensor(0.5), 1) == 0.5 and _rounded(np.float32(2.25), 1) == 2.2 and _rounded(None) is None
     with tempfile.TemporaryDirectory() as tmp:
         ckpt, results = os.path.join(tmp, "policy.pt"), os.path.join(tmp, "flights.jsonl")
         _demo_policy(ckpt)
