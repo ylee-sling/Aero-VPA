@@ -442,7 +442,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         np.add.at(confusion, (labels_all, u), 1)
         chunk, chunk_star = o["chunk"].astype(np.float64), o["chunk_star"].astype(np.float64)
         report["policies"][pol.name] = {
-            "checkpoint_id": pol.checkpoint_id, "sigma_lo": pol.cfg.sigma_lo, "sigma_crit": pol.cfg.sigma_crit,
+            "checkpoint_id": pol.checkpoint_id, "policy_state_inputs": list(pol.cfg.policy_state_inputs), "sigma_lo": pol.cfg.sigma_lo, "sigma_crit": pol.cfg.sigma_crit,
             "selector_accuracy": float((u == labels_all).mean()), "confusion": confusion.tolist(),
             "sigma_median": _q(o["sigma"], 0.5), "sigma_p95": _q(o["sigma"], 0.95),
             "fallback": float(o["fallback"].mean()), "above_sigma_lo": float((o["sigma"] > pol.cfg.sigma_lo).mean()),

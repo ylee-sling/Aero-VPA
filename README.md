@@ -243,6 +243,12 @@ python calibrate_sigma.py checkpoints/policy.pt "data_val/*.hdf5"
   fallback in a 60 s mission equals n_fa, with a bootstrap interval over flights; about 10 / n_fa = 200 flights
   resolve it. On 360 validation flights: `calibrate_sigma.py checkpoints/policy.pt "data_val/*.hdf5"
   --method episode_max --out checkpoints/policy_cal.pt`.
+* `train_stage2.py --policy_state_inputs velocity attitude rates` withholds the last command a_bar_t from the selector
+  and the CFM conditioning (the withheld groups of S_t enter at their training mean; P_omega still receives a_bar,
+  Eq. 7; the default is all four groups, Eq. 2). a_bar_t is the setpoint dispatched just before the frame and lies
+  within a few cm/s of the expert's next command, so a policy trained on it can repeat its previous command and
+  ignore the image: near-perfect on recorded frames, blind to obstacles and waypoints in flight (`input_sensitivity.py`
+  measures this). The choice is stored in the checkpoint; the cached latents stay valid.
 * Dataset aggregation, stage (iii) of Sec. 3.8 (DAgger), needs a closed-loop policy node in SITL and is the next step.
 
 ## Phase 3: closed-loop evaluation in SITL

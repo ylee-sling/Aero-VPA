@@ -13,6 +13,9 @@ With E_psi and P_omega frozen and their outputs cached by cache_latents.py, trai
     e_t   = Concat(Embed(u*_t), (z_t - mu_Z)/gamma*, (z_hat_{t+1} - mu_Z)/gamma*, (S_t - mu_S)/sigma_S, g_t, c_text)  (Eq. 15)
 
 on expert chunks A_t (heading frame of their capture time) divided by the half-widths of the action box A_0.
+--policy_state_inputs withholds groups of S_t from the selector and from e_t (they enter at their training mean;
+P_omega still receives a_bar): e.g. "velocity attitude rates" leaves out the last command a_bar, which is within
+a few cm/s of the expert's next command and lets a policy repeat it instead of using the image (input_sensitivity.py).
 mu_S and sigma_S are computed here from the training frames and fixed before training; the selector reads
 its inputs through the same standardisation. c_text is the learned null embedding for episodes without an
 instruction and the frozen CLIP embedding otherwise (computed once per distinct instruction).
@@ -52,7 +55,7 @@ from torch import Tensor
 from cache_latents import cache_is_current, cache_path, complete_episodes
 from checkpoint import atomic_torch_save, build_policy_modules, config_from_dict, environment_info, load_checkpoint, \
     make_checkpoint, save_checkpoint
-from config import PRIMITIVES
+from config import PRIMITIVES, STATE_GROUPS
 from dataset import episode_split, expand_paths
 from train_stage1 import RunLog, cosine_lr, data_summary, param_groups, pick_device, set_seed
 
@@ -207,6 +210,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--ema", type=float, default=0.999, help="EMA decay of the trained weights (0 = off)")
     p.add_argument("--class_weights", choices=["none", "inverse_sqrt"], default="none")
+    p.add_argument("--policy_state_inputs", nargs="+", choices=list(STATE_GROUPS), default=None,
+                   help="groups of S_t the selector and the CFM conditioning see (default: all four, Eq. 2)")
     p.add_argument("--device", default="auto")
     p.add_argument("--data_on_gpu", choices=["auto", "yes", "no"], default="auto")
     p.add_argument("--seed", type=int, default=0)
@@ -306,7 +311,10 @@ def train_stage2(args: argparse.Namespace) -> str:
     set_seed(args.seed)
     log = RunLog(args.out + ".log.jsonl")
     stage1 = load_checkpoint(args.stage1)
-    cfg = config_from_dict(stage1["config"], sigma_lo=None, sigma_crit=None)
+    overrides: Dict[str, Any] = {"sigma_lo": None, "sigma_crit": None}
+    if args.policy_state_inputs:
+        overrides["policy_state_inputs"] = tuple(args.policy_state_inputs)
+    cfg = config_from_dict(stage1["config"], **overrides)
     gamma = float(stage1["calibration"]["gamma_bar_star"])
     mu_z = stage1["calibration"]["latent_mean"].float()
     train, val = _stores(args, stage1["checkpoint_id"])
@@ -345,6 +353,10 @@ def train_stage2(args: argparse.Namespace) -> str:
         if not os.path.isfile(state_path):
             raise FileNotFoundError(f"--resume: no training state {state_path}")
         state = torch.load(state_path, map_location=device, weights_only=True)
+        saved_inputs = (state.get("args") or {}).get("policy_state_inputs")
+        if list(saved_inputs or []) != list(args.policy_state_inputs or []):
+            raise SystemExit(f"--resume: {state_path} was trained with --policy_state_inputs {saved_inputs}, "
+                             f"not {args.policy_state_inputs}")
         policy.load_state_dict(state["policy"])
         if ema is not None and state.get("ema") is not None:
             ema.load_state_dict(state["ema"])
@@ -364,8 +376,10 @@ def train_stage2(args: argparse.Namespace) -> str:
         f"{len(val) if val else 0} validation frames; {total} steps of {args.batch_size} "
         f"({total * args.batch_size / len(train):.1f} epochs) on {device}, data on "
         f"{'GPU' if on_gpu else 'CPU'} ({(train.nbytes + (val.nbytes if val else 0)) / 1e9:.2f} GB); "
-        f"{len(instructions)} distinct instructions; primitive counts {counts.long().tolist()}",
-        frames=len(train), steps=total, instructions=instructions, primitive_counts=counts.long().tolist())
+        f"{len(instructions)} distinct instructions; primitive counts {counts.long().tolist()}; S_t groups seen by "
+        f"the selector and e_t: {', '.join(cfg.policy_state_inputs) or 'none'}",
+        frames=len(train), steps=total, instructions=instructions, primitive_counts=counts.long().tolist(),
+        policy_state_inputs=list(cfg.policy_state_inputs))
     gen = torch.Generator(device=train.device).manual_seed(args.seed)
     last_save, t_log = time.time(), time.time()
     out: Dict[str, Tensor] = {}
@@ -502,6 +516,30 @@ def _self_test() -> None:
             raise AssertionError("expected a stale-cache error")
         except ValueError:
             pass
+        # --policy_state_inputs: the last command a_bar withheld from the selector and e_t, kept in the checkpoint
+        masked_path = os.path.join(tmp, "policy_no_command.pt")
+        masked = [stage1_path, train_file, "--latents", latents, "--out", masked_path, "--batch_size", "16",
+                  "--device", "cpu", "--log_every", "100", "--val_fraction", "0", "--warmup_steps", "1", "--steps", "2",
+                  "--policy_state_inputs", "velocity", "attitude", "rates"]
+        train_stage2(parse_args(masked))
+        mcfg = config_from_dict(load_checkpoint(masked_path, kind="policy")["config"])
+        assert mcfg.policy_state_inputs == ("velocity", "attitude", "rates") and cfg.policy_state_inputs == tuple(STATE_GROUPS)
+        mpipe = VPAInferencePipeline.from_checkpoint(masked_path, latency_bound=0.05, tracking_lag=0.03, sigma_lo=1e3,
+                                                     sigma_crit=2e3)
+        z = torch.randn(4, 256)
+        g, c = torch.randn(4, 4), mpipe.text_encoder(None).expand(4, -1)
+        s_a, s_b = torch.randn(4, 13), torch.randn(4, 13)
+        s_b[:, :9] = s_a[:, :9]                                                   # differ in a_bar only
+        with torch.no_grad():
+            assert torch.equal(mpipe.selector(z, g, s_a, c), mpipe.selector(z, g, s_b, c))
+            u = torch.zeros(4, dtype=torch.long)
+            assert torch.equal(mpipe.solver.build_conditioning(u, z, z, s_a, g, c),
+                               mpipe.solver.build_conditioning(u, z, z, s_b, g, c))
+        try:
+            train_stage2(parse_args(masked[:-4] + ["--steps", "3", "--resume"]))   # without --policy_state_inputs
+            raise AssertionError("resumed with other --policy_state_inputs")
+        except SystemExit as exc:
+            assert "--policy_state_inputs" in str(exc), exc
     print("train_stage2.py self-test passed")
 
 

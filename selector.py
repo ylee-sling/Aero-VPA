@@ -124,6 +124,8 @@ class PrimitiveSelector(nn.Module):
         text_dim: d_c (512).
         num_primitives: N_u = |U| (6).
         hidden_dims: widths of the hidden layers.
+        proprio_mask: optional ``[d_s]`` 0/1 factors on the standardised S_t (``config.policy_state_mask``): a
+            withheld component enters at its training mean. A fixed, non-persistent buffer (from the config).
 
     Shapes:
         ``input_features``:          (``z_t [B, d]``, ``g_t [B, d_g]``, ``S_t [B, d_s]``, ``c_text [B, d_c]``)
@@ -141,6 +143,7 @@ class PrimitiveSelector(nn.Module):
         text_dim: int = 512,
         num_primitives: int = len(Primitive),
         hidden_dims: Sequence[int] = (512, 512),
+        proprio_mask: Optional[Sequence[float]] = None,
     ) -> None:
         super().__init__()
         if num_primitives < 2:
@@ -167,6 +170,10 @@ class PrimitiveSelector(nn.Module):
         self.register_buffer("latent_scale", torch.ones(()))
         self.register_buffer("proprio_mean", torch.zeros(self.proprio_dim))
         self.register_buffer("proprio_std", torch.ones(self.proprio_dim))
+        mask = torch.ones(self.proprio_dim) if proprio_mask is None else torch.as_tensor(proprio_mask, dtype=torch.float32)
+        if tuple(mask.shape) != (self.proprio_dim,) or not bool(((mask == 0) | (mask == 1)).all()):
+            raise ValueError(f"proprio_mask must be {self.proprio_dim} values in {{0, 1}}")
+        self.register_buffer("proprio_mask", mask.clone(), persistent=False)
 
     @torch.no_grad()
     def set_input_standardization(
@@ -214,6 +221,7 @@ class PrimitiveSelector(nn.Module):
         dtype = z_t.dtype
         z = (z_t - self.latent_mean.to(dtype)) / self.latent_scale.to(dtype)                    # [B, d]
         s = (s_t.to(dtype) - self.proprio_mean.to(dtype)) / self.proprio_std.to(dtype)          # [B, d_s]
+        s = s * self.proprio_mask.to(dtype)                                                     # withheld groups: 0
         return torch.cat([z, g_t.to(dtype), s, c_text.to(dtype)], dim=-1)                       # [B, 785]
 
     def forward(self, z_t: Tensor, g_t: Tensor, s_t: Tensor, c_text: Tensor) -> Tensor:
@@ -646,7 +654,8 @@ def _self_test() -> None:
     assert round(AERO_SELECTOR_PARAMS / 1e6, 2) == config.TABLE1_PARAMS_M["selector"]
     assert count_parameters(PrimitiveSelector()) == 668_166                       # the defaults are Table 1
     assert sorted(name for name, _ in sel.named_buffers()) == [
-        "latent_mean", "latent_scale", "proprio_mean", "proprio_std"]
+        "latent_mean", "latent_scale", "proprio_mask", "proprio_mean", "proprio_std"]
+    assert "proprio_mask" not in sel.state_dict() and torch.equal(sel.proprio_mask, torch.ones(13))
 
     # ---- Eq. 12 input layout: [z_t 0:256 | g_t 256:260 | S_t 260:273 | c_text 273:785].
     b = 8
@@ -720,6 +729,20 @@ def _self_test() -> None:
     reloaded = PrimitiveSelector()
     reloaded.load_state_dict(std_sel.state_dict())                                # statistics live in the state_dict
     assert float(reloaded.latent_scale) == float(std_sel.latent_scale)
+
+    # ---- Withheld groups of S_t (config.policy_state_mask): no influence on the logits, enter at the mean.
+    masked = PrimitiveSelector(proprio_mask=(1.0,) * 9 + (0.0,) * 4)
+    masked.load_state_dict(std_sel.state_dict())                                  # the mask is not in the state_dict
+    assert "proprio_mask" not in masked.state_dict() and torch.equal(masked.proprio_std, sd_s)
+    s_other = s_t.clone()
+    s_other[:, 9:13] = 5.0 * torch.randn(b, 4, generator=gen)
+    with torch.no_grad():
+        assert torch.equal(masked(z_t, g_t, s_t, c_text), masked(z_t, g_t, s_other, c_text))
+        assert not torch.equal(std_sel(z_t, g_t, s_t, c_text), std_sel(z_t, g_t, s_other, c_text))
+        x_masked = masked.input_features(z_t, g_t, s_t, c_text)
+    assert torch.equal(x_masked[:, 269:273], torch.zeros(b, 4)) and torch.equal(x_masked[:, :269], x_std[:, :269])
+    _expect(ValueError, lambda: PrimitiveSelector(proprio_mask=(0.5,) * 13))
+    _expect(ValueError, lambda: PrimitiveSelector(proprio_mask=(1.0,) * 12))
     good = dict(latent_mean=mu_z, gamma_bar_star=gamma_star, proprio_mean=mu_s, proprio_std=sd_s)
     for kw in (dict(latent_mean=torch.zeros(255)), dict(gamma_bar_star=0.0), dict(gamma_bar_star=float("nan")),
                dict(proprio_std=torch.zeros(13)), dict(proprio_mean=torch.zeros(12)),

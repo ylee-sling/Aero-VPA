@@ -162,8 +162,9 @@ def print_report(report: Dict[str, Any]) -> None:
         return "-" if x is None else f"{x:.{d}f}"
 
     for name, r in report["policies"].items():
+        seen = r.get("policy_state_inputs")
         print(f"\n{name}: {r['frames']} frames; label spread (median |v0* - v0* of the donor frame|) "
-              f"{f(r['label_spread_median'])} m/s")
+              f"{f(r['label_spread_median'])} m/s" + (f"; S_t groups seen: {', '.join(seen) or 'none'}" if seen else ""))
         print(f"  {'swapped input':26s} {'change of v0 (m/s)':>19s} {'direction':>10s} {'yaw rate':>9s} {'primitive':>10s} "
               f"{'error to':>9s} {'error to':>9s}")
         print(f"  {'':26s} {'median / p90':>19s} {'(deg)':>10s} {'(rad/s)':>9s} {'changed':>10s} {'own label':>9s} "
@@ -203,6 +204,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         noise = torch.randn((n, p.pipe.solver.horizon, p.pipe.solver.action_dim), generator=gen)
         r = sensitivity(policy_decide(p), torch.cat(zs[p.name]), s, g, label, perm, noise, args.batch_size, device, args.moving)
         r["checkpoint_id"] = p.checkpoint_id
+        r["policy_state_inputs"] = list(p.cfg.policy_state_inputs)
         report["policies"][p.name] = r
     return report
 

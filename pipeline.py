@@ -224,6 +224,7 @@ class VPAInferencePipeline(nn.Module):
         selector = PrimitiveSelector(
             latent_dim=config.latent_dim, goal_dim=config.goal_dim, proprio_dim=config.proprio_dim,
             text_dim=config.text_dim, num_primitives=config.num_primitives, hidden_dims=config.selector_hidden,
+            proprio_mask=config.policy_state_mask,
         )
         return cls(
             vision_encoder=config.build_vision_encoder(),

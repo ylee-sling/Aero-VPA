@@ -151,7 +151,8 @@ class Policy:
                      "predictor_residual": bool(self.cfg.predictor_residual), "latency_bound": args.latency_bound,
                      "tracking_lag": args.tracking_lag, "execution_mode": args.execution_mode, "device": str(self.device),
                      "blind_speed": self.cfg.blind_speed, "safety_radius": self.cfg.safety_radius,
-                     "waypoint_radius": self.cfg.waypoint_radius}
+                     "waypoint_radius": self.cfg.waypoint_radius,
+                     "policy_state_inputs": list(self.cfg.policy_state_inputs)}
 
 
 def _stats_ms(values: List[float]) -> Dict[str, float]:

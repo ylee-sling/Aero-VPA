@@ -199,7 +199,7 @@ def build_policy_modules(cfg: VPAConfig) -> Tuple[nn.Module, nn.Module]:
         from solver import CFMSolver
     selector = PrimitiveSelector(
         latent_dim=cfg.latent_dim, goal_dim=cfg.goal_dim, proprio_dim=cfg.proprio_dim, text_dim=cfg.text_dim,
-        num_primitives=cfg.num_primitives, hidden_dims=cfg.selector_hidden,
+        num_primitives=cfg.num_primitives, hidden_dims=cfg.selector_hidden, proprio_mask=cfg.policy_state_mask,
     )
     return selector, CFMSolver.from_config(cfg)
 

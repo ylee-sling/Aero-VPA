@@ -32,7 +32,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
-__all__ = ["VPAConfig", "TABLE1_PARAMS_M", "PRIMITIVES"]
+__all__ = ["VPAConfig", "TABLE1_PARAMS_M", "PRIMITIVES", "STATE_GROUPS"]
 
 # Table 1 (millions, as printed).
 TABLE1_PARAMS_M: Dict[str, float] = {
@@ -43,6 +43,11 @@ TABLE1_PARAMS_M: Dict[str, float] = {
 PRIMITIVES: Tuple[str, ...] = (
     "CRUISE", "LATERAL_AVOID", "VERTICAL_AVOID", "YAW_SCAN", "APPROACH", "BRAKE_HOVER",
 )
+
+# The four groups of S_t (Eq. 2) as [start, stop) indices: v^H, n^B, omega^B and a_bar (the last dispatched setpoint).
+STATE_GROUPS: Dict[str, Tuple[int, int]] = {
+    "velocity": (0, 3), "attitude": (3, 6), "rates": (6, 9), "last_command": (9, 13),
+}
 
 
 @dataclass
@@ -72,6 +77,9 @@ class VPAConfig:
     # ---- Primitive selector (Sec. 3.3) ----
     num_primitives: int = 6                     # [P] N_u, see PRIMITIVES
     selector_hidden: Tuple[int, ...] = (512, 512)  # [P] Table 1
+    # [I] groups of S_t (STATE_GROUPS) that pi_phi^h (Eq. 12) and e_t (Eq. 15) see; the others enter at their
+    # training mean (0 after standardisation). P_omega always receives a_bar (Eq. 7). All four: Eq. 2 as written.
+    policy_state_inputs: Tuple[str, ...] = ("velocity", "attitude", "rates", "last_command")
 
     # ---- JEPA predictor (Sec. 3.2) ----
     ensemble_heads: int = 5                     # [P] N_e
@@ -151,6 +159,12 @@ class VPAConfig:
             raise ValueError("ensemble_heads must be >= 2 (Eq. 22 needs disagreement)")
         if self.predictor_hidden_layers < 1 or not self.selector_hidden or min(self.selector_hidden) < 1:
             raise ValueError("hidden layer specifications must be non-empty and positive")
+        unknown = [g for g in self.policy_state_inputs if g not in STATE_GROUPS]
+        if unknown or len(set(self.policy_state_inputs)) != len(self.policy_state_inputs):
+            raise ValueError(f"policy_state_inputs must be distinct groups of {list(STATE_GROUPS)}, got "
+                             f"{list(self.policy_state_inputs)}")
+        if self.proprio_dim != 13 and set(self.policy_state_inputs) != set(STATE_GROUPS):
+            raise ValueError("policy_state_inputs needs the 13-dimensional S_t of Eq. 2")
         if not 1 <= self.min_horizon <= self.horizon:
             raise ValueError("require 1 <= min_horizon <= horizon (Eq. 25)")
         if not 0.0 < self.depth_range[0] < self.depth_range[1]:
@@ -199,6 +213,17 @@ class VPAConfig:
     def selector_in_dim(self) -> int:
         """Eq. 12 input Concat(z_t, g_t, S_t, c_text): d + d_g + d_s + d_c = 785."""
         return self.latent_dim + self.goal_dim + self.proprio_dim + self.text_dim
+
+    @property
+    def policy_state_mask(self) -> Tuple[float, ...]:
+        """``[d_s]`` 1.0 where pi_phi^h and e_t see S_t, 0.0 where a group is withheld (``policy_state_inputs``)."""
+        if set(self.policy_state_inputs) == set(STATE_GROUPS):
+            return (1.0,) * self.proprio_dim
+        mask = [0.0] * self.proprio_dim
+        for group in self.policy_state_inputs:
+            start, stop = STATE_GROUPS[group]
+            mask[start:stop] = [1.0] * (stop - start)
+        return tuple(mask)
 
     @property
     def predictor_in_dim(self) -> int:
@@ -340,6 +365,16 @@ def _self_test() -> None:
     assert (sl["proprio"], sl["goal"], sl["text"]) == (slice(544, 557), slice(557, 561), slice(561, 1073))
     assert cfg.sequential_depth == 5 and math.isclose(cfg.chunk_duration_s, 0.32)
     assert cfg.action_scale == (7.0, 7.0, 2.0, 1.5) and len(PRIMITIVES) == cfg.num_primitives == 6
+    assert cfg.policy_state_mask == (1.0,) * 13                                     # Eq. 2 as written
+    no_command = VPAConfig(policy_state_inputs=("velocity", "attitude", "rates")).policy_state_mask
+    assert no_command == (1.0,) * 9 + (0.0,) * 4
+    assert VPAConfig(policy_state_inputs=("attitude",)).policy_state_mask == (0.0,) * 3 + (1.0,) * 3 + (0.0,) * 7
+    for bad in (("speed",), ("velocity", "velocity")):
+        try:
+            VPAConfig(policy_state_inputs=bad)
+            raise AssertionError(f"accepted policy_state_inputs={bad}")
+        except ValueError:
+            pass
     assert (cfg.action_dim, cfg.horizon, cfg.integration_steps, cfg.latent_dim) == (4, 16, 2, 256)
 
     # ---- E_psi from the config: [B, 4, 128, 160] -> [B, 256], 11,171,200 parameters.

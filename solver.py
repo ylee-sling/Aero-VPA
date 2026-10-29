@@ -252,6 +252,8 @@ class CFMSolver(nn.Module):
         action_scale: ``[d_a]`` positive half-widths of A_0.
         num_integration_steps: K >= 1.
         width, depth, num_heads, mlp_ratio, time_embed_dim: v_theta hyper-parameters.
+        proprio_mask: optional ``[d_s]`` 0/1 factors on the standardised S_t in e_t (``config.policy_state_mask``):
+            a withheld component enters at its training mean. A fixed, non-persistent buffer (from the config).
 
     Shapes:
         ``build_conditioning``: (``u [B]``, ``z_t [B, d]``, ``z_hat [B, d]``, ``S_t [B, d_s]``, ``g_t [B, d_g]``,
@@ -278,6 +280,7 @@ class CFMSolver(nn.Module):
         num_heads: int = 4,
         mlp_ratio: float = 4.0,
         time_embed_dim: int = 256,
+        proprio_mask: Optional[Sequence[float]] = None,
     ) -> None:
         super().__init__()
         if int(num_integration_steps) != num_integration_steps or num_integration_steps < 1:
@@ -309,6 +312,10 @@ class CFMSolver(nn.Module):
         self.register_buffer("proprio_mean", torch.full((self.proprio_dim,), nan))
         self.register_buffer("proprio_std", torch.full((self.proprio_dim,), nan))
         self.register_buffer("action_scale", scale)
+        mask = torch.ones(self.proprio_dim) if proprio_mask is None else torch.as_tensor(proprio_mask, dtype=torch.float32)
+        if tuple(mask.shape) != (self.proprio_dim,) or not bool(((mask == 0) | (mask == 1)).all()):
+            raise ValueError(f"proprio_mask must be {self.proprio_dim} values in {{0, 1}}")
+        self.register_buffer("proprio_mask", mask.clone(), persistent=False)
 
     @classmethod
     def from_config(cls, cfg: Any) -> "CFMSolver":
@@ -319,6 +326,7 @@ class CFMSolver(nn.Module):
             horizon=cfg.horizon, action_dim=cfg.action_dim, action_scale=cfg.action_scale,
             num_integration_steps=cfg.integration_steps, width=cfg.field_width, depth=cfg.field_depth,
             num_heads=cfg.field_heads, mlp_ratio=cfg.field_mlp_ratio, time_embed_dim=cfg.time_embed_dim,
+            proprio_mask=getattr(cfg, "policy_state_mask", None),
         )
 
     # ---------------- fixed statistics ----------------
@@ -394,7 +402,8 @@ class CFMSolver(nn.Module):
                 self.primitive_embedding(primitive.long()).to(dtype),                               # [B, d_u]
                 standardize_latents(z_t, self.latent_mean.to(dtype), self.gamma_bar_star.to(dtype)),  # [B, d]
                 standardize_latents(z_hat.to(dtype), self.latent_mean.to(dtype), self.gamma_bar_star.to(dtype)),
-                standardize_proprioception(s_t.to(dtype), self.proprio_mean.to(dtype), self.proprio_std.to(dtype)),
+                standardize_proprioception(s_t.to(dtype), self.proprio_mean.to(dtype), self.proprio_std.to(dtype))
+                * self.proprio_mask.to(dtype),                                                      # [B, d_s]
                 g_t.to(dtype),                                                                      # [B, d_g]
                 c_text.to(dtype),                                                                   # [B, d_c]
             ],
@@ -1148,6 +1157,17 @@ def _self_test() -> None:
                  (u, z_t[0], z_hat, s_t, g_t, c_text)):
         _expect(ValueError, lambda a=args: solver.build_conditioning(*a))
     e_t = e_t.detach()
+    # withheld groups of S_t (config.policy_state_mask): zero in e_t, everything else unchanged; not saved
+    from config import VPAConfig as _Config
+    masked = CFMSolver.from_config(_Config(policy_state_inputs=("velocity", "attitude", "rates")))
+    masked.load_state_dict(solver.state_dict())
+    assert "proprio_mask" not in masked.state_dict() and torch.equal(solver.proprio_mask, torch.ones(13))
+    e_masked = masked.build_conditioning(u, z_t, z_hat, s_t, g_t, c_text)
+    proprio = sl["proprio"].start
+    assert torch.equal(e_masked[:, proprio + 9:proprio + 13], torch.zeros(b, 4))
+    assert torch.equal(e_masked[:, :proprio + 9], e_t[:, :proprio + 9]) and torch.equal(e_masked[:, proprio + 13:],
+                                                                                          e_t[:, proprio + 13:])
+    _expect(ValueError, lambda: CFMSolver(proprio_mask=(1.0,) * 12))
 
     # ---- Eqs. 16, 17: flow-matching loss with a fixed generator (xi drawn before rho).
     a_true = torch.rand(b, h, da, generator=gen) * 2.0 - 1.0                                  # normalised chunk
