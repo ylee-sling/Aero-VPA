@@ -23,6 +23,11 @@ threshold, the speed is limited to a constant v_blind."
       directions within asin(r_s / reference_range) of u_t, i.e. the pixels that see the swept volume beyond
       ``reference_range``.
 
+``evaluate_detail`` also gives the reason (``REASONS``: in view and clear or with a return, or blind because u_t is
+behind the camera, outside the image horizontally, vertically or both, or R_t lacks returns) and the azimuth and
+elevation of u_t in the camera; ``rotation_from_gravity`` rebuilds the attitude of a recorded frame from n^B (in
+S_t) and the yaw, for checks on demonstrations (envelope_check.py).
+
 Choices the paper leaves open, as implemented here: the reference range of the invalid-pixel count (2 m) and the
 threshold. The default threshold 1.0 disables the invalid-pixel rule, because the Gazebo depth camera reports
 everything beyond its range (sky, distant ground) as invalid; on a real stereo sensor, set it (e.g. 0.5).
@@ -36,13 +41,42 @@ amount: the conservative side.
 from __future__ import annotations
 
 import math
-from typing import Callable, Optional, Tuple
+from typing import Callable, NamedTuple, Optional, Tuple
 
 import numpy as np
 import torch
 from torch import Tensor
 
-__all__ = ["DepthRange"]
+__all__ = ["DepthRange", "Reading", "REASONS", "rotation_from_gravity"]
+
+# Reading.reason: "still" (no direction), "clear" / "obstacle" (in view; d_t is the sensor range / a return), or
+# why the speed is limited to v_blind: "behind", "horizontal", "vertical", "corner" (outside the field of view)
+# or "invalid" (too few returns in R_t).
+REASONS = ("still", "clear", "obstacle", "behind", "horizontal", "vertical", "corner", "invalid")
+
+
+class Reading(NamedTuple):
+    """d_t, the blind flag, the reason (``REASONS``) and the direction u_t in the camera (degrees; azimuth to
+    the right, elevation up; NaN without a direction)."""
+
+    range: float
+    blind: bool
+    reason: str
+    azimuth: float
+    elevation: float
+
+
+def rotation_from_gravity(gravity_body: np.ndarray, yaw: float) -> np.ndarray:
+    """Body -> NED rotation from n^B (S_t[3:6], the unit gravity direction in the body frame) and the yaw:
+    R = R_z(yaw) R_y(pitch) R_x(roll), whose last row is n^B. ``[3]``, scalar -> ``[3, 3]``."""
+    n = np.asarray(gravity_body, dtype=np.float64)
+    n = n / max(float(np.linalg.norm(n)), 1e-12)
+    pitch, roll = -math.asin(float(np.clip(n[0], -1.0, 1.0))), math.atan2(float(n[1]), float(n[2]))
+    cy, sy, cp, sp, cr, sr = (math.cos(yaw), math.sin(yaw), math.cos(pitch), math.sin(pitch), math.cos(roll),
+                              math.sin(roll))
+    return np.array([[cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+                     [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+                     [-sp, cp * sr, cp * cr]])
 
 
 class DepthRange:
@@ -88,35 +122,59 @@ class DepthRange:
             return None
         return v[k] / speeds[k]
 
-    def evaluate(self, depth_m: np.ndarray, rotation_body_to_ned: np.ndarray, yaw: float,
-                 chunk_heading: np.ndarray) -> Tuple[float, bool]:
-        """(d_t in m, blind) for a depth image ``[H, W]`` (m; non-finite or <= 0: no return) and a chunk ``[H, 4]``."""
+    def body_direction(self, rotation_body_to_ned: np.ndarray, yaw: float, chunk_heading: np.ndarray
+                       ) -> Optional[np.ndarray]:
+        """u_t in the body FRD frame ``[3]`` (heading frame -> NED by ``yaw`` -> body by the attitude), or None."""
+        u_h = self.direction(chunk_heading)
+        if u_h is None:
+            return None
+        c, s = math.cos(yaw), math.sin(yaw)
+        u_ned = np.array([c * u_h[0] - s * u_h[1], s * u_h[0] + c * u_h[1], u_h[2]])
+        return np.asarray(rotation_body_to_ned, dtype=np.float64).T @ u_ned
+
+    def view(self, u_body: np.ndarray) -> str:
+        """Where a body-frame direction falls: "inside" the image, "behind" the image plane, or outside it
+        "horizontal"-ly (left / right), "vertical"-ly (above / below) or both ("corner")."""
+        u = np.asarray(u_body, dtype=np.float64)
+        if u[0] <= 1e-6:
+            return "behind"
+        px, py = self.f * u[1] / u[0] + 0.5 * self.width, self.f * u[2] / u[0] + 0.5 * self.height
+        out_h, out_v = not 0.0 <= px < self.width, not 0.0 <= py < self.height
+        return "corner" if out_h and out_v else "horizontal" if out_h else "vertical" if out_v else "inside"
+
+    def evaluate_detail(self, depth_m: np.ndarray, rotation_body_to_ned: np.ndarray, yaw: float,
+                        chunk_heading: np.ndarray) -> Reading:
+        """``evaluate`` with the reason and the direction (see ``Reading``)."""
         depth = np.asarray(depth_m, dtype=np.float64)
         if depth.shape != (self.height, self.width):
             raise ValueError(f"expected a {self.height}x{self.width} depth image, got {depth.shape}")
-        u_h = self.direction(chunk_heading)
-        if u_h is None:
-            return self.far, False
-        c, s = math.cos(yaw), math.sin(yaw)
-        u_ned = np.array([c * u_h[0] - s * u_h[1], s * u_h[0] + c * u_h[1], u_h[2]])
-        u = np.asarray(rotation_body_to_ned, dtype=np.float64).T @ u_ned                 # body FRD
-        if u[0] <= 1e-6:
-            return self.far, True                                                         # behind the image plane
-        px, py = self.f * u[1] / u[0] + 0.5 * self.width, self.f * u[2] / u[0] + 0.5 * self.height
-        if not (0.0 <= px < self.width and 0.0 <= py < self.height):
-            return self.far, True                                                         # outside the field of view
+        u = self.body_direction(rotation_body_to_ned, yaw, chunk_heading)
+        if u is None:
+            return Reading(self.far, False, "still", math.nan, math.nan)
+        azimuth = math.degrees(math.atan2(u[1], u[0]))
+        elevation = math.degrees(math.atan2(-u[2], math.hypot(u[0], u[1])))
+        where = self.view(u)
+        if where != "inside":
+            return Reading(self.far, True, where, azimuth, elevation)                    # outside the field of view
         valid = np.isfinite(depth) & (depth >= self.near) & (depth <= self.far)
         if self.max_invalid_fraction < 1.0:
             cone = (self.unit_rays @ u) >= self.cone_cos
             if cone.any() and float((~valid[cone]).mean()) > self.max_invalid_fraction:
-                return self.far, True
+                return Reading(self.far, True, "invalid", azimuth, elevation)
         points = np.where(valid, depth, 0.0)[..., None] * self.rays                      # [H, W, 3]
         along = points @ u
         range_sq = (points ** 2).sum(axis=-1)
         inside = valid & (along >= 0.0) & (range_sq - along ** 2 <= self.radius ** 2)
         if not inside.any():
-            return self.far, False
-        return float(min(self.far, math.sqrt(float(range_sq[inside].min())))), False
+            return Reading(self.far, False, "clear", azimuth, elevation)
+        return Reading(float(min(self.far, math.sqrt(float(range_sq[inside].min())))), False, "obstacle", azimuth,
+                       elevation)
+
+    def evaluate(self, depth_m: np.ndarray, rotation_body_to_ned: np.ndarray, yaw: float,
+                 chunk_heading: np.ndarray) -> Tuple[float, bool]:
+        """(d_t in m, blind) for a depth image ``[H, W]`` (m; non-finite or <= 0: no return) and a chunk ``[H, 4]``."""
+        r = self.evaluate_detail(depth_m, rotation_body_to_ned, yaw, chunk_heading)
+        return r.range, r.blind
 
     def for_step(self, depth_m: np.ndarray, rotation_body_to_ned: np.ndarray, yaw: float
                  ) -> Callable[[Tensor], Tuple[Tensor, Tensor]]:
@@ -185,6 +243,32 @@ def _self_test() -> None:
     fn = dr.for_step(wall, level, 0.0)
     d_t, b_t = fn(torch.tensor(forward, dtype=torch.float32)[None])
     assert d_t.shape == (1,) and b_t.dtype == torch.bool and float(d_t[0]) < 5.01
+    # reasons and directions
+    up_left, right = np.zeros((16, 4)), np.zeros((16, 4))
+    up_left[:, 0], up_left[:, 1], up_left[:, 2] = 1.0, -1.0, -1.2
+    right[:, 0], right[:, 1] = 1.0, 2.0                                            # 63 degrees right
+    for chunk, image, reason in ((forward, wall, "obstacle"), (forward, depth, "clear"), (right, wall, "horizontal"),
+                                 (side, wall, "behind"), (-forward, wall, "behind"), (steep, ground, "vertical"), (up_left, wall, "corner"),
+                                 (np.zeros((16, 4)), wall, "still")):
+        r = dr.evaluate_detail(image, level, 0.0, chunk)
+        assert r.reason == reason and r.reason in REASONS and r.blind == (reason in ("behind", "horizontal", "vertical",
+                                                                                      "corner")), (reason, r)
+        assert (r.range, r.blind) == dr.evaluate(image, level, 0.0, chunk)
+    assert strict.evaluate_detail(depth, level, 0.0, forward).reason == "invalid"
+    r = dr.evaluate_detail(wall, level, 0.0, side)
+    assert abs(r.azimuth - 90.0) < 1e-9 and abs(r.elevation) < 1e-9
+    r = dr.evaluate_detail(ground, level, 0.0, dive)
+    assert abs(r.azimuth) < 1e-9 and abs(r.elevation + 25.0) < 1e-9                 # descending: below the horizon
+    # attitude from n^B and yaw: the last row of R is n^B, and the yaw of R is the yaw
+    rng = np.random.default_rng(0)
+    for _ in range(100):
+        yaw, pitch, roll = rng.uniform(-math.pi, math.pi), rng.uniform(-1.2, 1.2), rng.uniform(-1.2, 1.2)
+        cy, sy, cp, sp, cr, sr = math.cos(yaw), math.sin(yaw), math.cos(pitch), math.sin(pitch), math.cos(roll), math.sin(roll)
+        rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+        ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+        rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+        ref = rz @ ry @ rx
+        assert np.allclose(rotation_from_gravity(ref[2], yaw), ref, atol=1e-9)
     print("clearance.py self-test passed")
 
 

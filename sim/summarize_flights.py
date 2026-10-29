@@ -4,6 +4,7 @@
 sim/summarize_flights.py -- Success rates and flight statistics of sim/fly_policy.py records, per policy.
 
     python3 sim/summarize_flights.py flights.jsonl [more.jsonl ...] [--by density] [--compare TAG_A TAG_B]
+    python3 sim/summarize_flights.py flights.jsonl --missions          # one line per mission
 
 Per policy (record tag): missions, success rate with a 95% Wilson interval, crashes (collision or ground),
 timeouts and other endings, waypoints reached, fallback onsets per mission and the share of missions with one,
@@ -13,6 +14,8 @@ decision compute time and decision age (capture to commit). ``--by density`` rep
 density (sparse / medium / dense, from the world name). With two policies (or ``--compare``), missions flown by
 both (same world and mission index, hence the same waypoints) are paired: both succeed, only one, neither, and
 the exact McNemar test on the discordant pairs. A mission recorded twice for a policy keeps its last record.
+``--missions`` lists every mission: ending, duration, path, speed, waypoints, blind share, fallback onsets, the
+most frequent primitives, s_t, sigma_bar, the smallest clearance and where the vehicle ended (from home).
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("results", nargs="+", help="JSON lines files")
     p.add_argument("--compare", nargs=2, metavar=("TAG_A", "TAG_B"), default=None)
     p.add_argument("--by", choices=["density", "world"], default=None, help="success rate per group")
+    p.add_argument("--missions", action="store_true", help="also list every mission")
     return p.parse_args(argv)
 
 
@@ -91,6 +95,9 @@ def stats(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "missions": n, "success": len(ok) / n if n else math.nan, "success_ci": (lo, hi),
         "crash": sum(ends.get(t, 0) for t in ("collision", "ground")) / n if n else math.nan,
+        "collision": ends.get("collision", 0) / n if n else math.nan, "ground": ends.get("ground", 0) / n if n else math.nan,
+        "duration": _median([r.get("duration_s") for r in records]),
+        "path": _median([r.get("path_length_m") for r in records]),
         "timeout": ends.get("timeout", 0) / n if n else math.nan, "endings": ends,
         "waypoints_reached": sum(r["waypoints_reached"] for r in records) / max(1, sum(r["waypoints"] for r in records)),
         "fallback_onsets": float(np.mean([r["fallback_onsets"] for r in records])) if n else math.nan,
@@ -106,6 +113,37 @@ def stats(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+PRIMITIVE_SHORT = ("CRU", "LAT", "VER", "YAW", "APP", "BRK")
+
+
+def mission_lines(data: Dict[str, Dict[Tuple[str, int], Dict[str, Any]]]) -> List[str]:
+    """One line per mission (policy, world, mission index order)."""
+    def f(x: Any, fmt: str) -> str:
+        return "-" if x is None or (isinstance(x, float) and not math.isfinite(x)) else format(x, fmt)
+
+    lines = [f"{'policy':22s} {'world':24s} {'k':>3s} {'ending':14s} {'dur s':>6s} {'path m':>6s} {'m/s':>5s} {'wp':>5s} "
+             f"{'blind':>6s} {'fb':>3s} {'primitives':22s} {'s_t':>5s} {'sig_bar':>7s} {'sig_max':>7s} {'clear':>6s} "
+             f"{'end from home (N, E, alt)':>27s}"]
+    for tag in sorted(data):
+        for (world, k), r in sorted(data[tag].items()):
+            counts = np.asarray(r.get("primitive_counts") or [], dtype=np.float64)
+            prims = ""
+            if counts.sum() > 0:
+                order = np.argsort(-counts)[:3]
+                prims = " ".join(f"{PRIMITIVE_SHORT[i]}{100 * counts[i] / counts.sum():.0f}" for i in order if counts[i] > 0)
+            end = r.get("final_position_ned")
+            home = r.get("home") or [0.0, 0.0, 0.0]
+            where = "-" if not end else f"{end[0] - home[0]:7.1f} {end[1] - home[1]:7.1f} {-end[2]:5.1f}"
+            lines.append(
+                f"{tag[:22]:22s} {world.replace('aero_forest_', '')[:24]:24s} {k:3d} {r['termination'][:14]:14s} "
+                f"{f(r.get('duration_s'), '6.1f'):>6s} {f(r.get('path_length_m'), '6.1f'):>6s} {f(r.get('mean_speed'), '5.2f'):>5s} "
+                f"{r['waypoints_reached']:>2d}/{r['waypoints']:<2d} "
+                f"{100.0 * r['blind_decisions'] / max(1, r['decisions']):5.0f}% {r['fallback_onsets']:3d} {prims:22s} "
+                f"{f(r.get('scale_mean'), '5.2f'):>5s} {f(r.get('sigma_bar_mean'), '7.3f'):>7s} "
+                f"{f(r.get('sigma_bar_max'), '7.3f'):>7s} {f(r.get('min_clearance_m'), '6.2f'):>6s} {where:>27s}")
+    return lines
+
+
 def report(data: Dict[str, Dict[Tuple[str, int], Dict[str, Any]]], by: Optional[str] = None,
            compare: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     tags = sorted(data)
@@ -113,11 +151,13 @@ def report(data: Dict[str, Dict[Tuple[str, int], Dict[str, Any]]], by: Optional[
     rows = [
         ("missions", lambda s: f"{s['missions']}"),
         ("success", lambda s: f"{100 * s['success']:.1f}% [{100 * s['success_ci'][0]:.0f}, {100 * s['success_ci'][1]:.0f}]"),
-        ("crash (collision, ground)", lambda s: f"{100 * s['crash']:.1f}%"),
+        ("crash (collision / ground)", lambda s: f"{100 * s['crash']:.1f}% ({100 * s['collision']:.0f} / "
+                                                 f"{100 * s['ground']:.0f})"),
         ("timeout", lambda s: f"{100 * s['timeout']:.1f}%"),
         ("other endings", lambda s: ", ".join(f"{k} {v}" for k, v in sorted(s["endings"].items())
                                               if k not in ("success", "collision", "ground", "timeout")) or "-"),
         ("waypoints reached", lambda s: f"{100 * s['waypoints_reached']:.1f}%"),
+        ("duration / path median (s, m)", lambda s: f"{s['duration']:.1f} / {s['path']:.1f}"),
         ("fallback onsets / mission", lambda s: f"{s['fallback_onsets']:.2f}"),
         ("missions with a fallback", lambda s: f"{100 * s['missions_with_fallback']:.1f}%"),
         ("braking or holding (s / mission)", lambda s: f"{s['not_tracking_s']:.1f}"),
@@ -186,6 +226,8 @@ def _self_test() -> None:
                 f.write(json.dumps(rec("B", "aero_forest_dense_s1000", k, k < 2, "success" if k < 2 else "collision")) + "\n")
             f.write(json.dumps(rec("B", "aero_forest_dense_s1000", 5, True, "success")) + "\n")   # re-flown: last wins
         out = report(load([path]), by="density")
+        lines = mission_lines(load([path]))
+        assert len(lines) == 1 + 12 and "dense_s1000" in lines[1] and "CRU" not in lines[1]
         assert out["stats"]["A"]["missions"] == 6 and out["stats"]["A"]["success"] == 1.0
         assert out["stats"]["B"]["missions"] == 6 and math.isclose(out["stats"]["B"]["success"], 0.5)
         assert out["paired"] == {"missions": 6, "both": 3, "only_a": 3, "only_b": 0, "neither": 0,
@@ -198,4 +240,7 @@ if __name__ == "__main__":
         _self_test()
     else:
         parsed = parse_args()
-        report(load(parsed.results), parsed.by, parsed.compare)
+        loaded = load(parsed.results)
+        if parsed.missions:
+            print("\n".join(mission_lines(loaded)) + "\n")
+        report(loaded, parsed.by, parsed.compare)

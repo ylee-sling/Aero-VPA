@@ -31,6 +31,11 @@ privileged clearance, waypoints reached, fallback decisions and onsets, time bra
 decisions, sigma_bar, the speed scale s_t, primitive counts, decision latency (compute) and decision age
 (capture to commit, the T_e2e that the envelope assumes below --latency_bound), setpoint gaps and dropped frames.
 
+--trace DIR also writes every decision of every mission to DIR/<tag>_<world>_e<k>.jsonl (the first line is the
+mission record): the state estimate, the active waypoint, the selected and final primitive, sigma and the gate,
+the raw and committed first knot, d_t with the blind reason and the direction in the camera, v_safe and s_t,
+the executor mode and the privileged clearance. sim/show_trace.py summarises a trace and draws it (SVG).
+
 --dry_run flies the same protocol without ROS: the kinematic model and the ray-cast camera of sim/expert.py in a
 synthetic forest (or --world_json). Its images are not Gazebo's, so it checks the plumbing, not the policy.
 
@@ -58,7 +63,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 import expert as E  # noqa: E402
 from checkpoint import config_from_dict, load_checkpoint  # noqa: E402
-from clearance import DepthRange  # noqa: E402
+from clearance import REASONS, DepthRange  # noqa: E402
 from collect_expert_dataset import OdometryBuffer, _ignore_sigint, _read_environment, decode_image  # noqa: E402
 from pipeline import MODE_TRACK, VPAInferencePipeline  # noqa: E402
 
@@ -91,6 +96,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="blind above this fraction of pixels without depth in R_t (1: off; Gazebo has no returns "
                         "beyond its range)")
     p.add_argument("--collision_distance", type=float, default=0.35, help="privileged distance of a collision (m)")
+    p.add_argument("--trace", default=None, metavar="DIR", help="write a per-decision trace of every mission to DIR")
     p.add_argument("--device", default="auto")
     p.add_argument("--dry_run", action="store_true", help="kinematic model and ray-cast camera, no ROS (plumbing only)")
     ros = p.add_argument_group("ROS 2")
@@ -143,7 +149,9 @@ class Policy:
         self.meta = {"checkpoint": os.path.abspath(args.checkpoint), "checkpoint_id": self.checkpoint_id,
                      "sigma_lo": self.cfg.sigma_lo, "sigma_crit": self.cfg.sigma_crit,
                      "predictor_residual": bool(self.cfg.predictor_residual), "latency_bound": args.latency_bound,
-                     "tracking_lag": args.tracking_lag, "execution_mode": args.execution_mode, "device": str(self.device)}
+                     "tracking_lag": args.tracking_lag, "execution_mode": args.execution_mode, "device": str(self.device),
+                     "blind_speed": self.cfg.blind_speed, "safety_radius": self.cfg.safety_radius,
+                     "waypoint_radius": self.cfg.waypoint_radius}
 
 
 def _stats_ms(values: List[float]) -> Dict[str, float]:
@@ -180,6 +188,8 @@ class Mission:
         self.max_setpoint_gap = 0.0
         self.last_frame = self.t0
         self.end_time = self.t0
+        self.last_mode, self.last_setpoint = -1, np.zeros(4)
+        self.trace: Optional[List[Dict[str, Any]]] = [] if getattr(args, "trace", None) else None
 
     @torch.no_grad()
     def decide(self, stamp: float, rgb: np.ndarray, depth: np.ndarray, position: np.ndarray, velocity: np.ndarray,
@@ -198,12 +208,14 @@ class Mission:
         f32 = dict(dtype=torch.float32, device=dev)
         state = p.pipe.proprioception(torch.as_tensor(velocity, **f32)[None], torch.as_tensor(E.gravity_in_body(q), **f32)[None],
                                       torch.as_tensor(rates, **f32)[None], torch.tensor([yaw], **f32))
-        blind = []
+        readings = []
 
         def clearance(chunk: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-            d, b = p.depth_range.for_step(depth_m, rotation, yaw)(chunk)
-            blind.append(bool(b[0]))
-            return d, b
+            """d_t and the blind flag of Sec. 3.6 for a batch of one (as DepthRange.for_step), keeping the reading."""
+            r = p.depth_range.evaluate_detail(depth_m, rotation, yaw, chunk[0].detach().cpu().numpy())
+            readings.append(r)
+            return (torch.tensor([r.range], dtype=chunk.dtype, device=chunk.device),
+                    torch.tensor([r.blind], dtype=torch.bool, device=chunk.device))
 
         started = time.perf_counter()
         out = p.pipe.step(image, state, torch.as_tensor(position, **f32)[None], torch.tensor([yaw], **f32), clearance,
@@ -216,11 +228,59 @@ class Mission:
         self.fallback_decisions += int(fallback)
         self.fallback_onsets += int(fallback and not self.prev_fallback)
         self.prev_fallback = fallback
-        self.blind_decisions += int(bool(blind and blind[0]))
+        self.blind_decisions += int(bool(readings and readings[0].blind))
         self.sigma_bar.append(float(out.sigma_bar[0]))
         if out.scale is not None and bool(out.committed[0]):
             self.scale.append(float(out.scale[0]))
         self.primitives[int(out.primitive[0])] += 1
+        if self.trace is not None:
+            self.trace.append(self._trace_row(stamp, position, velocity, yaw, q, rates, state, out,
+                                              readings[0] if readings else None))
+
+    def _trace_row(self, stamp: float, position: np.ndarray, velocity: np.ndarray, yaw: float, q: np.ndarray,
+                   rates: np.ndarray, state: torch.Tensor, out: Any, reading: Any) -> Dict[str, Any]:
+        """One decision of the --trace file (rounded; angles in degrees, frames as named)."""
+        def r(x: Any, n: int = 3) -> Any:
+            if x is None:
+                return None
+            a = np.asarray(x, dtype=np.float64)
+            return round(float(a), n) if a.ndim == 0 else [round(float(v), n) for v in a.ravel()]
+
+        m = int(out.waypoint_index[0])
+        wp = self.waypoints[min(max(m, 1), len(self.waypoints)) - 1]
+        gravity = E.gravity_in_body(q)
+        row: Dict[str, Any] = {
+            "t": r(float(stamp) - self.t0), "compute_ms": r(1e3 * self.latency[-1], 1),
+            "age_ms": r(1e3 * self.age[-1], 1) if self.age else None,
+            "p": r(position), "v": r(velocity), "yaw": r(math.degrees(yaw), 1), "rates": r(rates),
+            "tilt": r(math.degrees(math.acos(float(np.clip(gravity[2], -1.0, 1.0)))), 1),
+            "m": m, "wp_dist": r(np.linalg.norm(np.asarray(position, dtype=np.float64) - wp)), "goal": r(out.goal[0]),
+            "u_sel": int(out.selected_primitive[0]), "u": int(out.primitive[0]), "fallback": bool(out.fallback[0]),
+            "sigma": r(out.sigma[0], 4), "sigma_bar": r(out.sigma_bar[0], 4), "alpha": r(out.alpha[0]),
+            "H": int(out.validity_horizon[0]), "state": r(state[0]),
+            "clearance": r(self.world.distance(np.asarray(position, dtype=np.float64))) if len(self.world) else None,
+            "mode": self.last_mode, "setpoint": r(self.last_setpoint),
+        }
+        if out.chunk_raw is not None and bool(out.committed[0]):
+            raw = out.chunk_raw[0].cpu().numpy()
+            row.update(raw0=r(raw[0]), raw_peak=r(np.linalg.norm(raw[:, :3], axis=1).max()),
+                       cmd0=r(out.chunk[0, 0]), v_safe=r(out.v_safe[0]), scale=r(out.scale[0]))
+        if reading is not None:
+            row.update(d=r(reading.range), blind=bool(reading.blind), view=reading.reason, az=r(reading.azimuth, 1),
+                       el=r(reading.elevation, 1))
+        return row
+
+    def save_trace(self, directory: str, record: Dict[str, Any]) -> str:
+        """Write DIR/<tag>_<world>_e<k>.jsonl: the mission record, then one line per decision."""
+        os.makedirs(directory, exist_ok=True)
+        name = f"{record['tag']}_{record['world']}_e{int(record['episode']):03d}.jsonl"
+        path = os.path.join(directory, "".join(c if c.isalnum() or c in "._-" else "_" for c in name))
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            f.write(json.dumps({"kind": "mission", **record}, sort_keys=True) + "\n")
+            for row in self.trace or []:
+                f.write(json.dumps({"kind": "decision", **row}) + "\n")
+        os.replace(path + ".tmp", path)
+        return path
 
     def tick(self, now: float) -> Tuple[np.ndarray, np.ndarray, float]:
         """Executor tick: (NED velocity, NED acceleration feed-forward, yaw rate) to dispatch."""
@@ -232,8 +292,10 @@ class Mission:
             if self.has_chunk and int(out.mode[0]) != MODE_TRACK:
                 self.not_tracking_s += dt
         self.prev_tick = float(now)
-        return (out.velocity[0].cpu().numpy().astype(np.float64), out.acceleration[0].cpu().numpy().astype(np.float64),
-                float(out.yaw_rate[0]))
+        vel, acc = out.velocity[0].cpu().numpy().astype(np.float64), out.acceleration[0].cpu().numpy().astype(np.float64)
+        yaw_rate = float(out.yaw_rate[0])
+        self.last_mode, self.last_setpoint = int(out.mode[0]), np.array([*vel, yaw_rate])
+        return vel, acc, yaw_rate
 
     def observe(self, now: float, position: np.ndarray, velocity: np.ndarray) -> Optional[str]:
         """Motion statistics and the termination check at ``now``; the reason when the mission ends."""
@@ -274,6 +336,7 @@ class Mission:
             "waypoints": len(self.waypoints), "waypoints_reached": int(reached),
             "mission_length_m": float(np.linalg.norm(legs, axis=1).sum()), "waypoints_ned": self.waypoints.tolist(),
             "path_length_m": self.path_length, "mean_speed": self.speed_sum / max(1, self.speed_n),
+            "final_position_ned": self.prev_pos.tolist() if self.prev_pos is not None else None,
             "max_speed": self.max_speed, "min_clearance_m": self.min_clearance if math.isfinite(self.min_clearance) else None,
             "decisions": self.decisions, "fallback_decisions": self.fallback_decisions,
             "fallback_onsets": self.fallback_onsets, "not_tracking_s": self.not_tracking_s,
@@ -363,6 +426,8 @@ def run_dry(args: argparse.Namespace, physics_rate: float = 250.0, camera_rate: 
             vehicle.step(dt, vel, acc, yr)
             t += dt
         record = mission.record(termination, _record_extra(args, policy, k, "dry_run", home))
+        if args.trace:
+            record["trace"] = mission.save_trace(args.trace, record)
         append_record(args.results, record)
         records.append(record)
         print(f"[fly] mission {k}: {termination} after {record['duration_s']:.1f} s, {record['waypoints_reached']}/"
@@ -581,6 +646,11 @@ def run_ros(args: argparse.Namespace) -> int:
             mission, self.mission, self.frame = self.mission, None, None
             record = mission.record(termination, _record_extra(self.args, self.policy, self.k, "sitl",
                                                                self.home if self.home is not None else self.home_nominal))
+            if self.args.trace:
+                try:
+                    record["trace"] = mission.save_trace(self.args.trace, record)
+                except OSError as exc:
+                    self.get_logger().warning(f"could not write the trace: {exc}")
             append_record(self.args.results, record)
             self.records.append(record)
             age = record["decision_age_ms"]
@@ -750,6 +820,13 @@ def run_ros(args: argparse.Namespace) -> int:
             if self.mission is not None:
                 self.get_logger().info(f"mission {self.k} interrupted after {self.mission.end_time - self.mission.t0:.1f} s; "
                                        "not recorded (it is flown again on the next run)")
+                if self.args.trace and self.mission.trace:
+                    try:
+                        partial = self.mission.record("interrupted", _record_extra(
+                            self.args, self.policy, self.k, "sitl", self.home if self.home is not None else self.home_nominal))
+                        self.mission.save_trace(self.args.trace, partial)
+                    except (OSError, ValueError):
+                        pass
             self.pool.shutdown(wait=False, cancel_futures=True)
 
     sys.setswitchinterval(0.001)
@@ -804,9 +881,23 @@ def _self_test() -> None:
         base = [ckpt, "--dry_run", "--seed", "3", "--spacing", "4", "6", "--num_waypoints", "1", "1", "--timeout_factor",
                 "0.5", "--timeout_extra_s", "1", "--results", results, "--device", "cpu"]
         assert run_dry(parse_args(base + ["--episodes", "2"])) == 0
-        assert run_dry(parse_args(base + ["--episodes", "1", "--episode_start", "2", "--tag", "again"])) == 0
+        trace_dir = os.path.join(tmp, "trace")
+        assert run_dry(parse_args(base + ["--episodes", "1", "--episode_start", "2", "--tag", "again",
+                                          "--trace", trace_dir])) == 0
         records = [json.loads(line) for line in open(results, encoding="utf-8")]
         assert [(r["tag"], r["episode"]) for r in records] == [("policy.pt", 0), ("policy.pt", 1), ("again", 2)]
+        # --trace: the mission record, then one row per decision
+        assert "trace" not in records[0] and os.path.isfile(records[2]["trace"])
+        assert os.path.basename(records[2]["trace"]) == "again_synthetic_e002.jsonl"
+        lines = [json.loads(line) for line in open(records[2]["trace"], encoding="utf-8")]
+        assert lines[0]["kind"] == "mission" and lines[0]["termination"] == records[2]["termination"]
+        rows = lines[1:]
+        assert len(rows) == records[2]["decisions"] and all(row["kind"] == "decision" for row in rows)
+        assert {"t", "p", "v", "yaw", "m", "wp_dist", "goal", "u_sel", "u", "sigma_bar", "state", "mode",
+                "clearance"} <= set(rows[0])
+        assert sum(bool(row.get("blind")) for row in rows) == records[2]["blind_decisions"]
+        assert all(row["view"] in REASONS for row in rows if "view" in row)
+        assert any("raw0" in row and "scale" in row for row in rows) and len(records[2]["final_position_ned"]) == 3
         need = {"success", "termination", "duration_s", "expert_duration_s", "waypoints_ned", "path_length_m",
                 "min_clearance_m", "decisions", "fallback_onsets", "decision_latency_ms", "decision_age_ms",
                 "checkpoint_id", "sigma_crit", "world", "seed", "episode", "primitive_counts"}

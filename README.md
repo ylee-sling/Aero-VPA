@@ -119,6 +119,8 @@ python probe_depth.py --self-test
 python clearance.py
 python sim/fly_policy.py --self-test   # dry-run flights with an untrained policy
 python sim/summarize_flights.py --self-test
+python envelope_check.py --self-test
+python sim/show_trace.py --self-test
 
 # the release checks: headers, licence files, citation metadata, lint and all self-tests
 python scripts/check_release.py --run-tests
@@ -269,6 +271,23 @@ python3 probe_depth.py checkpoints/stage1.pt checkpoints/stage1_res.pt
 from Gazebo's, so it checks the plumbing rather than the policy. Dataset aggregation (DAgger, stage iii) will
 record these flights with expert labels.
 
+When missions fail, three tools separate the causes:
+
+```bash
+# every mission on one line: ending, duration, path, speed, blind share, primitives, s_t, sigma_bar, end point
+python3 sim/summarize_flights.py flights.jsonl --missions
+# the envelope and the blind rule on recorded expert flights, and the policy on the same frames without the
+# closed loop (selector agreement, first-knot errors, blind and throttling shares against the expert's)
+python3 envelope_check.py --data 'data_val/*.hdf5' --checkpoint checkpoints/policy_cal_ep.pt
+# one mission decision by decision: fly with --trace, then read or draw the trace
+sim/run_headless_sitl.sh --ros-ws ~/px4_ros_ws --instance 2 --world sim/worlds/test/aero_forest_sparse_s2000.sdf -- \
+    python3 sim/fly_policy.py checkpoints/policy_cal_ep.pt --episodes 2 --seed 2000 --results trace.jsonl --trace logs/trace
+python3 sim/show_trace.py logs/trace/*.jsonl --svg logs/trace/e000.svg
+```
+
+If the policy agrees with the expert on recorded frames but not in flight, the gap is compounding error on its
+own states (the case for DAgger); if it already disagrees on the expert's frames, the networks are the problem.
+
 ## Repository layout
 
 | File | Paper | Contents |
@@ -294,6 +313,8 @@ record these flights with expert labels.
 | `sim/fly_policy.py` | Algorithm 1, Sec. 5 | closed-loop policy flights in SITL (or a dry run), one JSON record per mission |
 | `sim/evaluate_worlds.sh` | Sec. 5 | resumable policy evaluation over many worlds |
 | `sim/summarize_flights.py` | Sec. 5 | success rates, failure modes and paired comparison of policies |
+| `sim/show_trace.py` | Sec. 5 | one traced mission decision by decision (`fly_policy.py --trace`), with an SVG |
+| `envelope_check.py` | Secs. 3.3-3.6 | envelope and blind rule on expert flights; the policy on the same frames, open loop |
 | `sim/collect_worlds.sh` | Sec. 5.1 | resumable sweep over many worlds: restarts, appends, skips complete worlds |
 | `sim/run_headless_sitl.sh` | Secs. 4.3, 5.1 | headless gz + PX4 SITL + uXRCE-DDS + ros_gz_bridge, with clean shutdown |
 | `sim/make_world.py`, `sim/models/` | Sec. 5.1 | E1 forest worlds with privileged maps; the `x500_vpa` RGB-D vehicle |
