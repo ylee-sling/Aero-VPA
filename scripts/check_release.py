@@ -58,7 +58,7 @@ SELF_TESTS = ("config.py", "perception.py", "predictor.py", "selector.py", "solv
               "cache_latents.py --self-test", "train_stage2.py --self-test", "calibrate_sigma.py --self-test",
               "diagnose_stage1.py --self-test", "probe_depth.py --self-test", "clearance.py",
               "sim/fly_policy.py --self-test", "sim/summarize_flights.py --self-test", "envelope_check.py --self-test",
-              "sim/show_trace.py --self-test", "input_sensitivity.py --self-test")
+              "sim/show_trace.py --self-test", "input_sensitivity.py --self-test", "sim/dagger.py")
 LINT_COMMAND = ("ruff", "check", "--select", "F,E9,B,PLE,PLW", ".")
 EXPECTED_FILES = (
     *(command.split()[0] for command in SELF_TESTS),
@@ -78,6 +78,7 @@ EXPECTED_FILES = (
     "sim/collect_expert_dataset.py",
     "sim/collect_worlds.sh",
     "sim/evaluate_worlds.sh",
+    "sim/dagger_round.sh",
     "sim/make_world.py",
     "sim/run_headless_sitl.sh",
     "sim/models/aero_vpa_rgbd/model.config",

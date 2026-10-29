@@ -31,6 +31,10 @@ privileged clearance, waypoints reached, fallback decisions and onsets, time bra
 decisions, sigma_bar, the speed scale s_t, primitive counts, decision latency (compute) and decision age
 (capture to commit, the T_e2e that the envelope assumes below --latency_bound), setpoint gaps and dropped frames.
 
+--dagger_dir DIR turns the flights into stage-(iii) data collection (sim/dagger.py): the privileged expert labels
+every frame with its own command for the state the vehicle is in and takes over before trouble; the frames go to
+DIR/<world>.hdf5 in the demonstration schema (sim/dagger_round.sh runs a whole round).
+
 --trace DIR also writes every decision of every mission to DIR/<tag>_<world>_e<k>.jsonl (the first line is the
 mission record): the state estimate, the active waypoint, the selected and final primitive, sigma and the gate,
 the raw and committed first knot, d_t with the blind reason and the direction in the camera, v_safe and s_t,
@@ -64,7 +68,9 @@ sys.path.insert(0, os.path.dirname(HERE))
 import expert as E  # noqa: E402
 from checkpoint import config_from_dict, load_checkpoint  # noqa: E402
 from clearance import REASONS, DepthRange  # noqa: E402
-from collect_expert_dataset import OdometryBuffer, _ignore_sigint, _read_environment, decode_image  # noqa: E402
+from collect_expert_dataset import OdometryBuffer, WriterProcess, _ignore_sigint, _read_environment, decode_image  # noqa: E402
+from dagger import DaggerSupervisor, GateConfig, InlineWriter, plan_now  # noqa: E402
+from dagger import file_attributes as dagger_file_attributes  # noqa: E402
 from pipeline import MODE_TRACK, VPAInferencePipeline  # noqa: E402
 
 RESULT_VERSION = 1
@@ -99,6 +105,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--trace", default=None, metavar="DIR", help="write a per-decision trace of every mission to DIR")
     p.add_argument("--device", default="auto")
     p.add_argument("--dry_run", action="store_true", help="kinematic model and ray-cast camera, no ROS (plumbing only)")
+    dag = p.add_argument_group("DAgger (stage iii, sim/dagger.py)")
+    dag.add_argument("--dagger_dir", default=None, metavar="DIR",
+                     help="record every frame with the expert's label to DIR/<world>.hdf5; the expert takes over when needed")
+    dag.add_argument("--speed_limits", type=float, nargs="+", default=[3.0, 5.0, 7.0],
+                     help="v_h of the expert reference, drawn per mission from (seed, k) as in the demonstrations")
+    dag.add_argument("--gate_clearance", type=float, default=0.5, help="privileged clearance now or 0.5 s ahead (m)")
+    dag.add_argument("--gate_altitude", type=float, default=0.8, help="height above the home ground (m)")
+    dag.add_argument("--gate_distance", type=float, default=1.5, help="corridor half-width around the expert path (m)")
+    dag.add_argument("--gate_heading", type=float, default=75.0, help="heading error to the path (deg)")
+    dag.add_argument("--gate_stall_s", type=float, default=5.0, help="time without progress (s)")
+    dag.add_argument("--recover_s", type=float, default=2.0, help="expert flight on the path before handing back (s)")
+    dag.add_argument("--dagger_compression", choices=["gzip", "lzf", "none"], default="gzip")
     ros = p.add_argument_group("ROS 2")
     ros.add_argument("--rgb_topic", default=os.environ.get("AERO_VPA_RGB_TOPIC", "/aero_vpa/rgbd/image"))
     ros.add_argument("--depth_topic", default=os.environ.get("AERO_VPA_DEPTH_TOPIC", "/aero_vpa/rgbd/depth_image"))
@@ -117,6 +135,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         p.error("give the policy checkpoint (or --self-test)")
     if args.episodes < 1:
         p.error("--episodes must be >= 1")
+    if args.dagger_dir and (not args.speed_limits or min(args.speed_limits) <= 0.0):
+        p.error("--speed_limits must be positive")
     args.tag = args.tag or os.path.basename(args.checkpoint)
     return args
 
@@ -166,8 +186,9 @@ class Mission:
     """One mission flown by the policy: decisions, executor ticks, termination checks and the record."""
 
     def __init__(self, policy: Policy, world: E.PrivilegedMap, waypoints: np.ndarray, start_time: float,
-                 expert_duration: float, args: argparse.Namespace) -> None:
+                 expert_duration: float, args: argparse.Namespace, dagger: Optional[DaggerSupervisor] = None) -> None:
         self.policy, self.world, self.args = policy, world, args
+        self.dagger = dagger
         self.waypoints = np.asarray(waypoints, dtype=np.float64)
         self.t0 = float(start_time)
         self.expert_duration = float(expert_duration)
@@ -194,9 +215,10 @@ class Mission:
 
     @torch.no_grad()
     def decide(self, stamp: float, rgb: np.ndarray, depth: np.ndarray, position: np.ndarray, velocity: np.ndarray,
-               q: np.ndarray, rates: np.ndarray, clock: Optional[Any] = None) -> None:
+               q: np.ndarray, rates: np.ndarray, clock: Optional[Any] = None, odometry_age: float = 0.0) -> None:
         """One decision on the frame captured at ``stamp`` with the state estimate at that time; ``clock()`` gives
-        the simulation time after the decision (decision age = capture to commit)."""
+        the simulation time after the decision (decision age = capture to commit). With DAgger, the frame is then
+        recorded with the expert's label (``dagger.DaggerSupervisor.on_frame``)."""
         p, dev = self.policy, self.policy.device
         self.last_frame = max(self.last_frame, float(stamp))
         image16 = E.encode_rgbd(rgb, depth)                                   # exactly as recorded for training
@@ -234,9 +256,20 @@ class Mission:
         if out.scale is not None and bool(out.committed[0]):
             self.scale.append(float(out.scale[0]))
         self.primitives[int(out.primitive[0])] += 1
+        labelled = None
+        if self.dagger is not None:
+            labelled = self.dagger.on_frame(stamp, image16, state[0].detach().cpu().numpy(),
+                                            out.goal[0].detach().cpu().numpy(), int(out.waypoint_index[0]),
+                                            bool(out.task_complete[0]), position, yaw, odometry_age)
         if self.trace is not None:
-            self.trace.append(self._trace_row(stamp, position, velocity, yaw, q, rates, state, out,
-                                              readings[0] if readings else None))
+            row = self._trace_row(stamp, position, velocity, yaw, q, rates, state, out, readings[0] if readings else None)
+            if self.dagger is not None:
+                row["dagger_mode"] = self.dagger.mode
+                if labelled is not None:
+                    row.update(controller=labelled["controller"], tau=_rounded(labelled["tau"]),
+                               e_path=_rounded(labelled["e_path"]), label0=_rounded(labelled["label0"]),
+                               label_primitive=labelled["primitive"])
+            self.trace.append(row)
 
     def _trace_row(self, stamp: float, position: np.ndarray, velocity: np.ndarray, yaw: float, q: np.ndarray,
                    rates: np.ndarray, state: torch.Tensor, out: Any, reading: Any) -> Dict[str, Any]:
@@ -293,6 +326,27 @@ class Mission:
         self.last_mode, self.last_setpoint = int(out.mode[0]), np.array([*vel, yaw_rate])
         return vel, acc, yaw_rate
 
+    def command(self, now: float, position: np.ndarray, velocity: np.ndarray, yaw: float
+                ) -> Tuple[np.ndarray, np.ndarray, float]:
+        """The setpoint to dispatch at ``now``: the expert's while it has control (DAgger), else the executor's.
+
+        Under the expert the executor is not ticked; the dispatched setpoint is handed to the pipeline instead
+        (a_bar of the next decision, and the point it cross-fades from when the policy flies again).
+        """
+        if self.dagger is not None:
+            cmd = self.dagger.control(now, position, velocity, yaw)
+            if cmd is not None:
+                vel, acc, yaw_rate = (np.asarray(cmd[0], dtype=np.float64), np.asarray(cmd[1], dtype=np.float64),
+                                      float(cmd[2]))
+                self.policy.pipe.external_setpoint(torch.as_tensor(vel, dtype=torch.float32)[None],
+                                                   torch.tensor([yaw_rate], dtype=torch.float32))
+                if self.prev_tick is not None:
+                    self.max_setpoint_gap = max(self.max_setpoint_gap, float(now) - self.prev_tick)
+                self.prev_tick = float(now)
+                self.last_mode, self.last_setpoint = -2, np.array([*vel, yaw_rate])          # -2: the expert
+                return vel, acc, yaw_rate
+        return self.tick(now)
+
     def observe(self, now: float, position: np.ndarray, velocity: np.ndarray) -> Optional[str]:
         """Motion statistics and the termination check at ``now``; the reason when the mission ends."""
         position = np.asarray(position, dtype=np.float64)
@@ -307,6 +361,8 @@ class Mission:
         self.end_time = float(now)
         if clearance < self.args.collision_distance:
             return "collision"
+        if self.dagger is not None and self.dagger.failed:
+            return self.dagger.failed
         if position[2] > -0.3:
             return "ground"
         if not self.world.inside_bounds(position):
@@ -343,6 +399,7 @@ class Mission:
             "primitive_counts": self.primitives.tolist(), "decision_latency_ms": _stats_ms(self.latency),
             "decision_age_ms": _stats_ms(self.age), "max_setpoint_gap_s": self.max_setpoint_gap,
             "dropped_frames": self.dropped_frames, "wall_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            **(self.dagger.summary() if self.dagger is not None else {}),
         }
 
 
@@ -371,16 +428,55 @@ def mission_for(world: E.PrivilegedMap, args: argparse.Namespace, k: int, home: 
     return E.sample_mission(world, rng, home, tuple(args.num_waypoints), tuple(args.spacing), tuple(args.altitude))
 
 
+def mission_speed(args: argparse.Namespace, k: int) -> float:
+    """v_h of the expert reference of mission ``k``: --expert_speed, or with DAgger a draw from --speed_limits
+    seeded with (seed, k), so that the labels have the speeds of the demonstrations."""
+    if not args.dagger_dir:
+        return float(args.expert_speed)
+    return float(np.random.default_rng([int(args.seed), int(k), 7]).choice(np.asarray(args.speed_limits, dtype=float)))
+
+
 def plan_mission(world: E.PrivilegedMap, planner: E.ExpertPlanner, args: argparse.Namespace, k: int,
                  home: np.ndarray) -> Tuple[np.ndarray, E.ExpertTrajectory]:
-    """(waypoints, expert reference at --expert_speed) of mission ``k`` (dry run: planned in this process)."""
+    """(waypoints, expert reference at ``mission_speed``) of mission ``k`` (dry run: planned in this process)."""
     for attempt in range(10):
         waypoints = mission_for(world, args, k, home, attempt)
         try:
-            return waypoints, planner.plan(home, waypoints, args.expert_speed, 0.0)
+            return waypoints, planner.plan(home, waypoints, mission_speed(args, k), 0.0)
         except E.PlanningError:
             continue
     raise E.PlanningError(f"no plannable mission {k} in 10 draws")
+
+
+def world_name(args: argparse.Namespace) -> str:
+    return os.environ.get("AERO_VPA_WORLD_NAME") or (os.path.splitext(os.path.basename(args.world_json))[0]
+                                                     if args.world_json else "synthetic")
+
+
+def dagger_gate(args: argparse.Namespace) -> GateConfig:
+    return GateConfig(clearance=args.gate_clearance, altitude=args.gate_altitude, distance=args.gate_distance,
+                      replan_distance=max(3.0, args.gate_distance), heading_deg=args.gate_heading,
+                      stall_s=args.gate_stall_s, recover_s=args.recover_s)
+
+
+def dagger_file(args: argparse.Namespace, policy: Policy) -> Tuple[str, Dict[str, Any]]:
+    """(DIR/<world>.hdf5, its root attributes) of the DAgger data of this run."""
+    attrs = dagger_file_attributes({"policy_checkpoint": policy.meta["checkpoint"],
+                                    "policy_checkpoint_id": policy.checkpoint_id, "tag": args.tag,
+                                    "gate": vars(dagger_gate(args)), "speed_limits": list(args.speed_limits),
+                                    "sim_environment": _read_environment(),
+                                    "fly_policy_args": {k: v for k, v in vars(args).items()}})
+    return os.path.join(args.dagger_dir, world_name(args) + ".hdf5"), attrs
+
+
+def make_supervisor(args: argparse.Namespace, policy: Policy, world: E.PrivilegedMap, planner: E.ExpertPlanner,
+                    waypoints: np.ndarray, k: int, spline: E.MinSnapSpline, yaw: float, start_time: float, plan: Any,
+                    writer: Any) -> DaggerSupervisor:
+    """The DAgger supervisor of mission ``k``, whose reference is the expert's plan ``spline`` from the start."""
+    attrs = {"world": world_name(args), "world_json": args.world_json or "", "seed": int(args.seed), "mission": int(k),
+             "tag": args.tag, "policy_checkpoint_id": policy.checkpoint_id, "instruction": ""}
+    return DaggerSupervisor(world, planner, waypoints, mission_speed(args, k), E.ExpertTrajectory(spline, yaw),
+                            start_time, plan, writer, attrs, dagger_gate(args))
 
 
 def _summary(records: List[Dict[str, Any]]) -> str:
@@ -394,10 +490,9 @@ def _summary(records: List[Dict[str, Any]]) -> str:
 
 
 def _record_extra(args: argparse.Namespace, policy: Policy, k: int, mode: str, home: np.ndarray) -> Dict[str, Any]:
-    world = os.environ.get("AERO_VPA_WORLD_NAME") or (os.path.splitext(os.path.basename(args.world_json))[0]
-                                                      if args.world_json else "synthetic")
-    return {"tag": args.tag, **policy.meta, "world": world, "world_json": args.world_json or "", "seed": int(args.seed),
-            "episode": int(k), "mode": mode, "home": [float(v) for v in home], "expert_speed": args.expert_speed,
+    return {"tag": args.tag, **policy.meta, "world": world_name(args), "world_json": args.world_json or "",
+            "seed": int(args.seed), "episode": int(k), "mode": mode, "home": [float(v) for v in home],
+            "expert_speed": mission_speed(args, k), "dagger": bool(args.dagger_dir),
             "sim_environment": _read_environment() if mode == "sitl" else {}}
 
 
@@ -411,10 +506,20 @@ def run_dry(args: argparse.Namespace, physics_rate: float = 250.0, camera_rate: 
     home = np.array([0.0, 0.0, -args.takeoff_altitude])
     render_rng = np.random.default_rng(args.seed)
     records = []
+    writer = None
+    if args.dagger_dir:
+        os.makedirs(args.dagger_dir, exist_ok=True)
+        path, attrs = dagger_file(args, policy)
+        writer = InlineWriter(path, attrs, append=True,
+                              compression=None if args.dagger_compression == "none" else args.dagger_compression)
     for k in range(args.episode_start, args.episode_start + args.episodes):
         waypoints, reference = plan_mission(world, planner, args, k, home)
         vehicle = E.KinematicQuadrotor(home, reference.initial_heading() or 0.0)
-        mission = Mission(policy, world, waypoints, 0.0, reference.duration, args)
+        supervisor = None
+        if writer is not None:
+            supervisor = make_supervisor(args, policy, world, planner, waypoints, k, reference.spline, vehicle.yaw, 0.0,
+                                         lambda s, w, v: plan_now(planner, s, w, v), writer)
+        mission = Mission(policy, world, waypoints, 0.0, reference.duration, args, supervisor)
         t, dt = 0.0, 1.0 / physics_rate
         next_cam, next_ctrl = 0.0, 0.0
         vel, acc, yr = np.zeros(3), np.zeros(3), 0.0
@@ -426,11 +531,13 @@ def run_dry(args: argparse.Namespace, physics_rate: float = 250.0, camera_rate: 
                                np.array([0.0, 0.0, vehicle.yaw_rate]), clock=lambda t=t: t)
                 next_cam += 1.0 / camera_rate
             if t >= next_ctrl - 1e-9:
-                vel, acc, yr = mission.tick(t)
+                vel, acc, yr = mission.command(t, vehicle.p.copy(), vehicle.v.copy(), vehicle.yaw)
                 termination = mission.observe(t, vehicle.p, vehicle.v)
                 next_ctrl += 1.0 / args.control_rate
             vehicle.step(dt, vel, acc, yr)
             t += dt
+        if supervisor is not None:
+            supervisor.finish(termination)
         record = mission.record(termination, _record_extra(args, policy, k, "dry_run", home))
         if args.trace:
             record["trace"] = mission.save_trace(args.trace, record)
@@ -438,6 +545,8 @@ def run_dry(args: argparse.Namespace, physics_rate: float = 250.0, camera_rate: 
         records.append(record)
         print(f"[fly] mission {k}: {termination} after {record['duration_s']:.1f} s, {record['waypoints_reached']}/"
               f"{record['waypoints']} waypoints, {record['decisions']} decisions", flush=True)
+    if writer is not None:
+        writer.close()
     print(f"[fly] {args.tag}: {_summary(records)}", flush=True)
     return 0
 
@@ -471,6 +580,14 @@ def run_ros(args: argparse.Namespace) -> int:
             self.policy = Policy(args)
             self.planner = E.ExpertPlanner(self.world)
             self.pool = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"), initializer=_ignore_sigint)
+            self.writer: Optional[WriterProcess] = None
+            if args.dagger_dir:
+                os.makedirs(args.dagger_dir, exist_ok=True)
+                path, attrs = dagger_file(args, self.policy)
+                self.writer = WriterProcess(path, attrs, append=True,
+                                            compression=None if args.dagger_compression == "none" else args.dagger_compression)
+                self.get_logger().info(f"DAgger: expert-labelled frames go to {path}")
+            self.plan_spline: Optional[E.MinSnapSpline] = None
             self.home_nominal = np.array([0.0, 0.0, -args.takeoff_altitude])
             self.home: Optional[np.ndarray] = None
             self.odom = OdometryBuffer()
@@ -608,9 +725,9 @@ def run_ros(args: argparse.Namespace) -> int:
             if est is None:
                 self.mission.dropped_frames += 1
                 return
-            pos, vel, q, rates, _ = est
+            pos, vel, q, rates, age = est
             try:
-                self.mission.decide(stamp, rgb, depth, pos, vel, q, rates, clock=self.sim_now)
+                self.mission.decide(stamp, rgb, depth, pos, vel, q, rates, clock=self.sim_now, odometry_age=age)
             except Exception as exc:
                 self.fail_run(f"decision failed: {type(exc).__name__}: {exc}")
 
@@ -650,6 +767,8 @@ def run_ros(args: argparse.Namespace) -> int:
 
         def finish_mission(self, termination: str, now: float, pos: np.ndarray, yaw: float) -> None:
             mission, self.mission, self.frame = self.mission, None, None
+            if mission.dagger is not None:
+                mission.dagger.finish(termination)
             record = mission.record(termination, _record_extra(self.args, self.policy, self.k, "sitl",
                                                                self.home if self.home is not None else self.home_nominal))
             if self.args.trace:
@@ -685,6 +804,8 @@ def run_ros(args: argparse.Namespace) -> int:
             if self.exit_code is not None:
                 return
             try:
+                if self.writer is not None:
+                    self.writer.check()
                 self._step()
             except Exception as exc:
                 self.fail_run(f"{type(exc).__name__}: {exc}")
@@ -742,7 +863,7 @@ def run_ros(args: argparse.Namespace) -> int:
 
             if self.phase == "MISSION":
                 self._try_decide()
-                v_cmd, a_ff, yr = self.mission.tick(now)
+                v_cmd, a_ff, yr = self.mission.command(now, pos, vel, yaw)
                 self.publish_setpoint(now, v_cmd, a_ff, yr)
                 reason = self.mission.observe(now, pos, vel)
                 if reason is None and now - self.last_frame_sim > 0.5 and now - self.mission.t0 > 1.0:
@@ -761,7 +882,7 @@ def run_ros(args: argparse.Namespace) -> int:
                 if self.plan_future is None:
                     self.waypoints = mission_for(self.world, self.args, self.k, self.home_nominal, self.plan_attempt)
                     self.plan_future = self.pool.submit(E.plan_mission_spline, self.args.world_json, self.home_nominal,
-                                                        self.waypoints, self.args.expert_speed)
+                                                        self.waypoints, mission_speed(self.args, self.k))
                 elif self.plan_future.done():
                     future, self.plan_future = self.plan_future, None
                     try:
@@ -774,6 +895,7 @@ def run_ros(args: argparse.Namespace) -> int:
                                                   f"{self.plan_attempt}")
                         return
                     self.plan_attempt = 0
+                    self.plan_spline = spline
                     reference = E.ExpertTrajectory(spline, yaw)
                     self.reference_duration = reference.duration
                     self.heading = reference.initial_heading() or yaw
@@ -783,10 +905,18 @@ def run_ros(args: argparse.Namespace) -> int:
                     raise RuntimeError("expert planning took more than 60 s")
             elif self.phase == "ALIGN":
                 if (abs(float(E.wrap_angle(self.heading - yaw))) < 0.08 and elapsed > 0.5) or elapsed > 8.0:
-                    self.mission = Mission(self.policy, self.world, self.waypoints, now, self.reference_duration, self.args)
+                    supervisor = None
+                    if self.writer is not None:
+                        supervisor = make_supervisor(
+                            self.args, self.policy, self.world, self.planner, self.waypoints, self.k, self.plan_spline,
+                            yaw, now, lambda s, w, v: self.pool.submit(E.plan_mission_spline, self.args.world_json, s, w, v),
+                            self.writer)
+                    self.mission = Mission(self.policy, self.world, self.waypoints, now, self.reference_duration, self.args,
+                                           supervisor)
                     self.frame = None
                     self.get_logger().info(f"mission {self.k}: {len(self.waypoints)} waypoints, reference "
-                                           f"{self.reference_duration:.1f} s at {self.args.expert_speed} m/s")
+                                           f"{self.reference_duration:.1f} s at {mission_speed(self.args, self.k):g} m/s"
+                                           + (" (DAgger)" if supervisor is not None else ""))
                     self.set_phase("MISSION")
                     return
             elif self.phase == "RETURN_PLAN":
@@ -826,6 +956,11 @@ def run_ros(args: argparse.Namespace) -> int:
             if self.mission is not None:
                 self.get_logger().info(f"mission {self.k} interrupted after {self.mission.end_time - self.mission.t0:.1f} s; "
                                        "not recorded (it is flown again on the next run)")
+                if self.mission.dagger is not None:
+                    try:
+                        self.mission.dagger.finish("interrupted")
+                    except Exception as exc:  # the writer may already have failed; the run is ending anyway
+                        self.get_logger().warning(f"could not close the DAgger segment: {exc}")
                 if self.args.trace and self.mission.trace:
                     try:
                         partial = self.mission.record("interrupted", _record_extra(
@@ -834,6 +969,11 @@ def run_ros(args: argparse.Namespace) -> int:
                     except (OSError, ValueError):
                         pass
             self.pool.shutdown(wait=False, cancel_futures=True)
+            if self.writer is not None:
+                try:
+                    self.writer.close()
+                except Exception as exc:
+                    self.get_logger().error(f"DAgger writer: {exc}")
 
     sys.setswitchinterval(0.001)
     rclpy.init()
@@ -923,6 +1063,41 @@ def _self_test() -> None:
         assert not np.allclose(mission_for(world, args, 0, home, attempt=1), records[0]["waypoints_ned"])
         out = report(load([results]))
         assert out["stats"]["policy.pt"]["missions"] == 2 and out["stats"]["again"]["missions"] == 1
+
+        # DAgger (sim/dagger.py): the untrained policy flies, the expert labels every frame and takes over
+        import h5py
+
+        import inspect_hdf5
+        from config import VPAConfig
+        from dataset import AeroVPADataset
+
+        dagger_dir, dagger_results = os.path.join(tmp, "dagger"), os.path.join(tmp, "dagger.jsonl")
+        dag = [ckpt, "--dry_run", "--seed", "4", "--spacing", "6", "8", "--num_waypoints", "2", "2", "--timeout_factor",
+               "3", "--timeout_extra_s", "20", "--results", dagger_results, "--device", "cpu", "--dagger_dir", dagger_dir,
+               "--speed_limits", "3", "--episodes", "1", "--trace", trace_dir, "--tag", "dag"]
+        assert run_dry(parse_args(dag), camera_rate=10.0) == 0                     # 10 Hz frames: a faster test
+        rec = [json.loads(line) for line in open(dagger_results, encoding="utf-8")][-1]
+        assert rec["dagger"] and rec["dagger_speed_limit"] == 3.0 and rec["expert_speed"] == 3.0
+        frames = rec["dagger_frames_policy"] + rec["dagger_frames_expert"]
+        assert frames > 0 and sum(rec["dagger_takeovers"].values()) >= 1 and rec["dagger_segments"] >= 1
+        path = os.path.join(dagger_dir, "synthetic.hdf5")
+        report_h5 = inspect_hdf5.validate_file(path, VPAConfig())
+        assert not report_h5["errors"], report_h5["errors"]
+        assert len(AeroVPADataset(path, 2)) == frames
+        with h5py.File(path, "r") as f:
+            assert f.attrs["source"] == "dagger" and f.attrs["policy_checkpoint_id"] == rec["checkpoint_id"]
+            eps = [f[k] for k in sorted(f) if k.startswith("episode_")]
+            assert all(int(ep.attrs["mission"]) == 0 and float(ep.attrs["speed_limit"]) == 3.0 for ep in eps)
+        rows = [json.loads(line) for line in open(rec["trace"], encoding="utf-8")][1:]
+        assert {"dagger_mode"} <= set(rows[0]) and any(r.get("controller") == "expert" for r in rows)
+        labelled = [r for r in rows if "controller" in r]
+        assert len(labelled) >= frames and all(len(r["label0"]) == 4 for r in labelled)
+        # a second run appends to the same file
+        assert run_dry(parse_args(dag[:-6] + ["--episodes", "1", "--episode_start", "1", "--tag", "dag"]),
+                       camera_rate=10.0) == 0
+        with h5py.File(path, "r") as f:
+            missions = sorted({int(f[k].attrs["mission"]) for k in f if k.startswith("episode_")})
+        assert missions == [0, 1], missions
     print("fly_policy.py self-test passed")
 
 

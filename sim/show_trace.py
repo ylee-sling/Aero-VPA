@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 SHORT = ("CRU", "LAT", "VER", "YAW", "APP", "BRK")
-MODES = {-1: "-", 0: "TRACK", 1: "BRAKE", 2: "HOLD"}
+MODES = {-2: "EXPERT", -1: "-", 0: "TRACK", 1: "BRAKE", 2: "HOLD"}
 BLIND = ("behind", "horizontal", "vertical", "corner", "invalid")
 
 
@@ -130,6 +130,14 @@ def analyse(record: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any
         if r["wp_dist"] < w["closest"]:
             w["closest"], w["at"] = r["wp_dist"], r["t"]
         w["to"] = r["t"]
+    disagreement, dir_err = [], []
+    for r in rows:                                   # DAgger: the policy's raw first knot against the expert's label
+        if r.get("controller") == "policy" and r.get("raw0") is not None and r.get("label0") is not None:
+            raw, lab = np.asarray(r["raw0"][:3]), np.asarray(r["label0"][:3])
+            disagreement.append(float(np.linalg.norm(raw - lab)))
+            if np.linalg.norm(raw) > 0.3 and np.linalg.norm(lab) > 0.3:
+                cos = float(raw @ lab / (np.linalg.norm(raw) * np.linalg.norm(lab)))
+                dir_err.append(math.degrees(math.acos(max(-1.0, min(1.0, cos)))))
     speeds = [float(np.linalg.norm(r["v"])) for r in rows]
     raw_speeds = [float(np.linalg.norm(r["raw0"][:3])) for r in rows if r.get("raw0") is not None]
     cmd_speeds = [float(np.linalg.norm(r["cmd0"][:3])) for r in rows if r.get("cmd0") is not None]
@@ -148,6 +156,9 @@ def analyse(record: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any
         "sigma_bar_median": _median([r["sigma_bar"] for r in rows]),
         "clearance_min": min((r["clearance"] for r in rows if r.get("clearance") is not None), default=None),
         "waypoints": wps,
+        "dagger_modes": Counter(r["dagger_mode"] for r in rows if "dagger_mode" in r),
+        "labelled": Counter(r["controller"] for r in rows if "controller" in r),
+        "label_error_median": _median(disagreement), "label_direction_median": _median(dir_err),
     }
 
 
@@ -201,6 +212,11 @@ def report(path: str, record: Dict[str, Any], rows: List[Dict[str, Any]], brief:
     print(f"   speed median: raw first knot {_f(a['raw_speed_median'], 2)}, committed {_f(a['cmd_speed_median'], 2)}, flown "
           f"{_f(a['speed_median'], 2)} m/s; s_t median {_f(a['scale_median'], 2)}; sigma_bar median "
           f"{_f(a['sigma_bar_median'], 3)} (lo {_f(record.get('sigma_lo'), 3)}, crit {_f(record.get('sigma_crit'), 3)})")
+    if a["dagger_modes"]:
+        tk = record.get("dagger_takeovers") or {}
+        print(f"   DAgger: {_shares(a['dagger_modes'], n)} of decisions; labelled {dict(a['labelled'])}; takeovers "
+              f"{', '.join(f'{k} {v}' for k, v in tk.items() if v) or 'none'}; policy vs expert label (policy frames): "
+              f"|v0 - v0*| median {_f(a['label_error_median'], 2)} m/s, direction {_f(a['label_direction_median'], 0)} deg")
     for m, w in sorted(a["waypoints"].items()):
         print(f"   waypoint {m}: active {w['from']:.1f}-{w['to']:.1f} s, closest {w['closest']:.2f} m at {w['at']:.1f} s"
               f"{'' if w['closest'] >= a['waypoint_radius'] else ' (reached)'}")

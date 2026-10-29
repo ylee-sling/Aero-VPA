@@ -13,6 +13,8 @@ With E_psi and P_omega frozen and their outputs cached by cache_latents.py, trai
     e_t   = Concat(Embed(u*_t), (z_t - mu_Z)/gamma*, (z_hat_{t+1} - mu_Z)/gamma*, (S_t - mu_S)/sigma_S, g_t, c_text)  (Eq. 15)
 
 on expert chunks A_t (heading frame of their capture time) divided by the half-widths of the action box A_0.
+--source_weight PATTERN=FACTOR draws the frames of the files matching PATTERN FACTOR times as often as the others
+(e.g. "dagger*/*.hdf5=5" for the stage-(iii) data of sim/dagger.py, which is small next to the demonstrations).
 --policy_state_inputs withholds groups of S_t from the selector and from e_t (they enter at their training mean;
 P_omega still receives a_bar): e.g. "velocity attitude rates" leaves out the last command a_bar, which is within
 a few cm/s of the expert's next command and lets a policy repeat it instead of using the image (input_sensitivity.py).
@@ -40,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import fnmatch
 import math
 import os
 import time
@@ -59,7 +62,8 @@ from config import PRIMITIVES, STATE_GROUPS
 from dataset import episode_split, expand_paths
 from train_stage1 import RunLog, cosine_lr, data_summary, param_groups, pick_device, set_seed
 
-__all__ = ["LatentStore", "InstructionTable", "state_statistics", "evaluate_stage2", "train_stage2", "parse_args"]
+__all__ = ["LatentStore", "FrameSampler", "InstructionTable", "state_statistics", "evaluate_stage2", "train_stage2",
+           "parse_args"]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -77,7 +81,7 @@ class LatentStore:
         only_successful: skip episodes whose ``success`` attribute is False.
     """
 
-    FIELDS = ("z", "z_hat", "state", "goal", "actions", "primitive", "instruction", "episode")
+    FIELDS = ("z", "z_hat", "state", "goal", "actions", "primitive", "instruction", "episode", "source")
 
     def __init__(self, sources: Sequence[str], latent_dir: str, checkpoint_id: str, episode_filter: Any = None,
                  only_successful: bool = True) -> None:
@@ -111,7 +115,7 @@ class LatentStore:
             "z": np.empty((n, d), np.float32), "z_hat": np.empty((n, d), np.float32),
             "state": np.empty((n, 13), np.float32), "goal": np.empty((n, 4), np.float32),
             "actions": np.empty((n, 16, 4), np.float32), "primitive": np.empty(n, np.int64),
-            "instruction": np.empty(n, np.int64), "episode": np.empty(n, np.int64),
+            "instruction": np.empty(n, np.int64), "episode": np.empty(n, np.int64), "source": np.empty(n, np.int64),
         }
         row = 0
         for k, (source, name, frames, instruction) in enumerate(chosen):
@@ -128,6 +132,7 @@ class LatentStore:
                 arrays["primitive"][sl] = ep["primitives"][...]
                 arrays["instruction"][sl] = ids.get(instruction, 0)
                 arrays["episode"][sl] = k
+                arrays["source"][sl] = self.sources.index(source)
             row += frames
         self.tensors: Dict[str, Tensor] = {key: torch.from_numpy(value) for key, value in arrays.items()}
         for key in ("z", "z_hat", "state", "goal", "actions"):
@@ -152,6 +157,57 @@ class LatentStore:
     def batch(self, index: Tensor, device: torch.device) -> Dict[str, Tensor]:
         index = index.to(self.device)
         return {k: v[index].to(device, non_blocking=True) for k, v in self.tensors.items()}
+
+
+class FrameSampler:
+    """Training indices: uniform over all frames, or with per-file weights (``--source_weight PATTERN=FACTOR``).
+
+    Weighted draws are two-stage: the number of frames from each weight group is multinomial with probabilities
+    proportional to (frames in the group) x (factor), then frames are drawn uniformly within each group.
+    """
+
+    def __init__(self, store: "LatentStore", weights: Sequence[str], generator: torch.Generator) -> None:
+        self.n, self.gen, self.device = len(store), generator, store.device
+        factors = []
+        for source in store.sources:
+            factor = 1.0
+            for spec in weights:
+                pattern, _, value = spec.rpartition("=")
+                if fnmatch.fnmatch(source, pattern) or fnmatch.fnmatch(os.path.basename(source), pattern):
+                    factor = float(value)
+            factors.append(factor)
+        if any(not (math.isfinite(f) and f >= 0.0) for f in factors):
+            raise ValueError(f"--source_weight factors must be finite and non-negative: {weights}")
+        per_frame = torch.as_tensor(factors, dtype=torch.float64)[store.tensors["source"].cpu()]
+        self.groups: List[Tensor] = []
+        mass = []
+        for value in sorted(set(factors)):
+            idx = torch.nonzero(per_frame == value).flatten()
+            if idx.numel() and value > 0.0:
+                self.groups.append(idx.to(self.device))
+                mass.append(value * idx.numel())
+        if not self.groups:
+            raise ValueError("--source_weight leaves no frames to train on")
+        self.probs = torch.tensor(mass, dtype=torch.float64) / sum(mass)
+        self.uniform = len(self.groups) == 1 and self.groups[0].numel() == self.n
+        self.shares = {f"{int((per_frame == v).sum())} frames x {v:g}": float(p) for v, p in
+                       zip(sorted({f for f in factors if f > 0.0 and bool((per_frame == f).any())}), self.probs.tolist(),
+                           strict=True)}
+
+    def draw(self, batch_size: int) -> Tensor:
+        if self.uniform:
+            return torch.randint(self.n, (batch_size,), generator=self.gen, device=self.device)
+        counts = torch.multinomial(self.probs, batch_size, replacement=True,
+                                   generator=self._cpu_gen()).bincount(minlength=len(self.groups))
+        parts = [g[torch.randint(g.numel(), (int(c),), generator=self.gen, device=self.device)]
+                 for g, c in zip(self.groups, counts.tolist(), strict=True) if c > 0]
+        return torch.cat(parts)
+
+    def _cpu_gen(self) -> torch.Generator:
+        if not hasattr(self, "_cpu"):
+            self._cpu = torch.Generator().manual_seed(int(torch.randint(2 ** 31, (1,), generator=self.gen,
+                                                                         device=self.device).item()))
+        return self._cpu
 
 
 def state_statistics(state: Tensor, eps: float = 1e-6) -> tuple:
@@ -210,6 +266,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--ema", type=float, default=0.999, help="EMA decay of the trained weights (0 = off)")
     p.add_argument("--class_weights", choices=["none", "inverse_sqrt"], default="none")
+    p.add_argument("--source_weight", action="append", default=[], metavar="PATTERN=FACTOR",
+                   help="draw frames of files matching PATTERN FACTOR times as often (repeatable)")
     p.add_argument("--policy_state_inputs", nargs="+", choices=list(STATE_GROUPS), default=None,
                    help="groups of S_t the selector and the CFM conditioning see (default: all four, Eq. 2)")
     p.add_argument("--device", default="auto")
@@ -381,10 +439,14 @@ def train_stage2(args: argparse.Namespace) -> str:
         frames=len(train), steps=total, instructions=instructions, primitive_counts=counts.long().tolist(),
         policy_state_inputs=list(cfg.policy_state_inputs))
     gen = torch.Generator(device=train.device).manual_seed(args.seed)
+    sampler = FrameSampler(train, args.source_weight, gen)
+    if not sampler.uniform:
+        log("sampling", "frames drawn per batch: " + ", ".join(f"{k}: {100 * v:.1f}%" for k, v in sampler.shares.items()),
+            shares=sampler.shares)
     last_save, t_log = time.time(), time.time()
     out: Dict[str, Tensor] = {}
     while step < total:
-        idx = torch.randint(len(train), (args.batch_size,), generator=gen, device=train.device)
+        idx = sampler.draw(args.batch_size)
         batch = train.batch(idx, device)
         for group in optimizer.param_groups:
             group["lr"] = cosine_lr(step, total, args.lr, args.warmup_steps)
@@ -435,6 +497,7 @@ def train_stage2(args: argparse.Namespace) -> str:
                   "val_frames": len(val) if val else 0, "val_metrics": final_val, "instructions": instructions,
                   "primitive_counts": counts.long().tolist(), "stage1_provenance": stage1["provenance"],
                   "split": {"val": args.val, "val_fraction": args.val_fraction, "split_seed": args.split_seed},
+                  "source_weight": list(args.source_weight),
                   **environment_info()}
     ckpt = make_checkpoint("policy", cfg, states, calibration, provenance)
     save_checkpoint(args.out, ckpt)
@@ -516,6 +579,16 @@ def _self_test() -> None:
             raise AssertionError("expected a stale-cache error")
         except ValueError:
             pass
+        # --source_weight: per-file sampling weights (two-stage draws), uniform without them
+        both = LatentStore([train_file, val_file], latents, load_checkpoint(stage1_path)["checkpoint_id"])
+        assert int(both.tensors["source"].max()) == 1 and len(both) == 90
+        g = torch.Generator().manual_seed(0)
+        assert FrameSampler(both, [], g).uniform
+        heavy = FrameSampler(both, ["*val.hdf5=3"], g)
+        draws = torch.cat([heavy.draw(512) for _ in range(20)])
+        share = float((both.tensors["source"][draws] == 1).float().mean())
+        assert abs(share - 0.6) < 0.03, share                                    # 30 x 3 / (60 x 1 + 30 x 3)
+        assert not bool((both.tensors["source"][FrameSampler(both, [f"{train_file}=0"], g).draw(256)] == 0).any())
         # --policy_state_inputs: the last command a_bar withheld from the selector and e_t, kept in the checkpoint
         masked_path = os.path.join(tmp, "policy_no_command.pt")
         masked = [stage1_path, train_file, "--latents", latents, "--out", masked_path, "--batch_size", "16",

@@ -728,6 +728,27 @@ class VPAInferencePipeline(nn.Module):
         out = self.tick(now, odometry_valid)
         return out._replace(replanned=replanned, step_output=step_output)
 
+    @torch.no_grad()
+    def external_setpoint(self, velocity_ned: Tensor, yaw_rate: Tensor) -> None:
+        """Record a setpoint that another controller dispatched instead of the executor (an expert takeover
+        while collecting DAgger data, Sec. 3.8). It becomes a_bar of the next decision (``proprioception``) and
+        the hold point from which the executor cross-fades (Eq. 35) when it tracks a chunk again; the executor
+        is marked as holding, not braking. Call it for every dispatched setpoint and do not ``tick`` meanwhile.
+
+        Args:
+            velocity_ned: ``[B, 3]`` NED velocity setpoint (m/s).
+            yaw_rate: ``[B]`` yaw-rate setpoint (rad/s).
+        """
+        self._require_episode()
+        b, device = self._last_setpoint.shape[0], self._last_setpoint.device
+        v = torch.as_tensor(velocity_ned, dtype=torch.float32, device=device)
+        r = torch.as_tensor(yaw_rate, dtype=torch.float32, device=device)
+        if tuple(v.shape) != (b, 3) or tuple(r.shape) != (b,):
+            raise ValueError(f"expected velocity_ned [{b}, 3] and yaw_rate [{b}], got {tuple(v.shape)}, {tuple(r.shape)}")
+        self._last_setpoint = torch.cat([v, r.unsqueeze(-1)], dim=-1)
+        self._last_mode = torch.full_like(self._last_mode, MODE_HOLD)
+        self._braking = torch.zeros_like(self._braking)
+
     # ------------------------------------------------------------------ state accessors
     @property
     def waypoint_index(self) -> Optional[Tensor]:
@@ -1077,6 +1098,20 @@ def _self_test() -> None:
     assert decisions[0] == 9.0 and len(decisions) >= 2
     gaps = [round(decisions[i + 1] - decisions[i], 2) for i in range(len(decisions) - 1)]
     assert all(0.29 <= g <= 0.31 for g in gaps), gaps                                     # H_t Delta = 0.30 s
+
+    # ---- External setpoints (an expert takeover): a_bar of the next decision, then a cross-fade from them.
+    pipe.reset("hold the corridor", waypoints, mission_start=0.0)
+    pipe.step(frame(), state(), pos, yaw, torch.full((b,), 30.0), capture_time=10.0)
+    pipe.tick(10.0)
+    v_ext, r_ext = torch.tensor([[1.0, -0.5, 0.2], [0.0, 2.0, 0.0]]), torch.tensor([0.3, -0.1])
+    pipe.external_setpoint(v_ext, r_ext)
+    s_ext = pipe.proprioception(torch.zeros(b, 3), torch.tensor([[0.0, 0.0, 1.0]] * b), torch.zeros(b, 3), yaw)
+    assert _close(s_ext[:, 9:12], world_to_heading(v_ext, yaw)) and _close(s_ext[:, 12], r_ext)
+    pipe.step(frame(), s_ext, pos, yaw, torch.full((b,), 30.0), capture_time=10.5)
+    resumed = pipe.tick(10.5)                                                       # first tick of the new chunk
+    assert resumed.mode.tolist() == [MODE_TRACK] * b
+    assert _close(resumed.velocity, v_ext) and _close(resumed.yaw_rate, r_ext)        # lambda = 0: the expert's setpoint
+    _expect(ValueError, lambda: pipe.external_setpoint(v_ext[:, :2], r_ext))
 
     # ---- Argument checks.
     pipe.reset("x", waypoints)

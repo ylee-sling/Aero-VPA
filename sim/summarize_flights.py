@@ -110,7 +110,24 @@ def stats(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         "blind": sum(r["blind_decisions"] for r in records) / max(1, sum(r["decisions"] for r in records)),
         "latency_p95_ms": _median([r["decision_latency_ms"]["p95"] for r in records]),
         "age_p95_ms": _median([r["decision_age_ms"]["p95"] for r in records]),
+        **_dagger_stats([r for r in records if r.get("dagger")]),
     }
+
+
+def _dagger_stats(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Stage-(iii) flights (fly_policy.py --dagger_dir): who flew, why the expert took over, what was recorded."""
+    if not records:
+        return {}
+    n = len(records)
+    reasons: Dict[str, float] = {}
+    for r in records:
+        for k, v in (r.get("dagger_takeovers") or {}).items():
+            reasons[k] = reasons.get(k, 0.0) + v / n
+    shares = [r.get("dagger_policy_share") for r in records]
+    return {"dagger_missions": n, "dagger_policy_share": _median([x for x in shares if x is not None]),
+            "dagger_takeovers": reasons, "dagger_replans": float(np.mean([r.get("dagger_replans", 0) for r in records])),
+            "dagger_frames_policy": float(np.mean([r.get("dagger_frames_policy", 0) for r in records])),
+            "dagger_frames_expert": float(np.mean([r.get("dagger_frames_expert", 0) for r in records]))}
 
 
 PRIMITIVE_SHORT = ("CRU", "LAT", "VER", "YAW", "APP", "BRK")
@@ -169,6 +186,20 @@ def report(data: Dict[str, Dict[Tuple[str, int], Dict[str, Any]]], by: Optional[
         ("decision compute p95 (ms)", lambda s: f"{s['latency_p95_ms']:.1f}"),
         ("decision age p95 (ms)", lambda s: f"{s['age_p95_ms']:.1f}"),
     ]
+    if any("dagger_missions" in table[t] for t in tags):
+        def takeovers(st: Dict[str, Any]) -> str:
+            reasons = st.get("dagger_takeovers") or {}
+            top = sorted(((v, k) for k, v in reasons.items() if v > 0), reverse=True)[:2]
+            return f"{sum(reasons.values()):.1f}" + (f" ({', '.join(f'{k} {v:.1f}' for v, k in top)})" if top else "")
+
+        rows += [
+            ("DAgger: policy share of the time", lambda st: "-" if st.get("dagger_policy_share") is None
+             else f"{100 * st['dagger_policy_share']:.0f}%"),
+            ("DAgger: takeovers / mission", lambda st: takeovers(st) if "dagger_missions" in st else "-"),
+            ("DAgger: frames / mission (pol/exp)", lambda st: f"{st['dagger_frames_policy']:.0f} / "
+             f"{st['dagger_frames_expert']:.0f}" if "dagger_missions" in st else "-"),
+            ("DAgger: re-plans / mission", lambda st: f"{st['dagger_replans']:.2f}" if "dagger_missions" in st else "-"),
+        ]
     width = max(24, *(len(t) + 2 for t in tags))
     print(f"{'':34s}" + "".join(f"{t:>{width}s}" for t in tags))
     for label, fmt in rows:

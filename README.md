@@ -122,6 +122,7 @@ python sim/summarize_flights.py --self-test
 python envelope_check.py --self-test
 python sim/show_trace.py --self-test
 python input_sensitivity.py --self-test
+python sim/dagger.py       # stage (iii): expert labels, takeover gate and recording on a kinematic vehicle
 
 # the release checks: headers, licence files, citation metadata, lint and all self-tests
 python scripts/check_release.py --run-tests
@@ -249,7 +250,9 @@ python calibrate_sigma.py checkpoints/policy.pt "data_val/*.hdf5"
   within a few cm/s of the expert's next command, so a policy trained on it can repeat its previous command and
   ignore the image: near-perfect on recorded frames, blind to obstacles and waypoints in flight (`input_sensitivity.py`
   measures this). The choice is stored in the checkpoint; the cached latents stay valid.
-* Dataset aggregation, stage (iii) of Sec. 3.8 (DAgger), needs a closed-loop policy node in SITL and is the next step.
+* `train_stage2.py --source_weight 'dagger_r*/*.hdf5=3'` draws the frames of the matching files three times as often
+  as the others (two-stage sampling; the log prints the share of each group per batch).
+* Dataset aggregation, stage (iii) of Sec. 3.8 (DAgger): see Phase 4.
 
 ## Phase 3: closed-loop evaluation in SITL
 
@@ -300,6 +303,32 @@ A policy that follows a swapped last command a_bar_t and ignores a swapped image
 previous command (the copycat shortcut of imitation from action histories): near-perfect on recorded frames,
 blind to obstacles and waypoints in flight.
 
+## Phase 4: dataset aggregation (stage iii, DAgger)
+
+`sim/fly_policy.py --dagger_dir DIR` flies the policy and records every frame with the privileged expert's command
+for the state the vehicle is actually in (`sim/dagger.py`). The expert's reference is its minimum-snap plan of the
+mission (speed drawn per mission from 3, 5 and 7 m/s, as in the demonstrations); the label is its tracking law from
+the point of that path nearest to the vehicle, so it steers back onto the path, turns the camera to the direction
+of travel and keeps the reference speed. The expert takes over before trouble (an obstacle within 0.5 m now or in
+0.5 s, below 0.8 m, more than 1.5 m off the path, facing more than 75 degrees away from it, a missed waypoint, no
+progress for 5 s): it flies back to the path when the straight line is clear and short (still recording), and
+otherwise brakes, re-plans from where it stopped through the remaining waypoints and turns to the new path before
+flying it; after 2 s back on the path the policy flies again. Every decision runs the policy as deployed, so S_t
+holds the setpoint that was actually dispatched. Frames go to `DIR/<world>.hdf5` in the demonstration schema, one
+episode per recorded segment, so `cache_latents.py` and `train_stage2.py` read them unchanged.
+
+```bash
+# one round: fly the policy over the 200 training worlds (3 simulators), cache the new latents, retrain stage (ii)
+# on the demonstrations plus every round so far (DAgger frames drawn 3x as often), calibrate sigma
+sim/dagger_round.sh --round 1 --policy checkpoints/policy_res_noact_cal_ep.pt --stage1 checkpoints/stage1_res.pt
+# then evaluate checkpoints/policy_r1_cal_ep.pt on the test worlds (Phase 3) and fly round 2 with it
+```
+
+The round reuses the stage-(ii) settings of the flying policy (steps, batch size, learning rate, EMA, validation
+split, `policy_state_inputs`), so rounds differ only in their data; every step is resumable. `summarize_flights.py`
+reports the share of flight time under the policy, the takeovers by reason and the frames recorded per mission;
+`show_trace.py` on a traced DAgger flight (`--trace`) shows the policy's first knot against the expert's label.
+
 ## Repository layout
 
 | File | Paper | Contents |
@@ -326,6 +355,8 @@ blind to obstacles and waypoints in flight.
 | `sim/evaluate_worlds.sh` | Sec. 5 | resumable policy evaluation over many worlds |
 | `sim/summarize_flights.py` | Sec. 5 | success rates, failure modes and paired comparison of policies |
 | `sim/show_trace.py` | Sec. 5 | one traced mission decision by decision (`fly_policy.py --trace`), with an SVG |
+| `sim/dagger.py` | Sec. 3.8 (iii) | DAgger: expert labels at the policy's states, takeover gate, segment recording |
+| `sim/dagger_round.sh` | Sec. 3.8 (iii) | one DAgger round: flights, latent caches, stage (ii) on the aggregate, calibration |
 | `envelope_check.py` | Secs. 3.3-3.6 | envelope and blind rule on expert flights; the policy on the same frames, open loop |
 | `input_sensitivity.py` | Secs. 3.3-3.4 | which inputs the policy's decision follows (one input swapped between frames at a time) |
 | `sim/collect_worlds.sh` | Sec. 5.1 | resumable sweep over many worlds: restarts, appends, skips complete worlds |
