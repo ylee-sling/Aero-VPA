@@ -174,11 +174,15 @@ def _row_line(r: Dict[str, Any]) -> str:
             f"{_f(None if raw is None else float(np.linalg.norm(raw[:3])), 2):>5s} "
             f"{_f(None if raw is None else command_bearing(r, 0.0), 0):>5s} {_f(None if raw is None else raw[3], 2):>6s} "
             f"{_f(None if cmd is None else float(np.linalg.norm(cmd[:3])), 2):>5s} {_f(r.get('clearance'), 2):>5s} "
-            f"{MODES.get(int(r.get('mode', -1)), '?'):5s} {r['sigma_bar']:.3f}")
+            f"{MODES.get(int(r.get('mode', -1)), '?'):6s} {r['sigma_bar']:.3f}"
+            + (f"  {r['dagger_mode'][:6]:6s} {_f(r.get('e_path'), 2):>5s} "
+               f"{_f(None if r.get('label0') is None else float(np.linalg.norm(r['label0'][:3])), 2):>5s}"
+               if "dagger_mode" in r else ""))
 
 
 HEADER = ("     t       x       y   alt   spd    yaw  m  wpdst   brg  u_sel/u   view     az   el     d vsafe     s "
-          " |raw|  rbrg  yawr  |cmd|   clr mode  sigma_bar")
+          " |raw|  rbrg  yawr  |cmd|   clr mode   sigma_bar")
+DAGGER_HEADER = "  dagger  epath |lab|"
 
 
 def report(path: str, record: Dict[str, Any], rows: List[Dict[str, Any]], brief: bool, every: float, last: float) -> Dict[str, Any]:
@@ -223,8 +227,9 @@ def report(path: str, record: Dict[str, Any], rows: List[Dict[str, Any]], brief:
     if brief:
         return a
     print("   timeline (* blind; F fallback; brg: waypoint bearing; rbrg / yawr: raw first knot bearing and yaw rate; "
-          "|cmd|: after s_t and the rate limit)")
-    print("   " + HEADER)
+          "|cmd|: after s_t and the rate limit" + ("; dagger: who flies, epath: distance to the expert path, |lab|: "
+                                                  "speed of the expert's label" if a["dagger_modes"] else "") + ")")
+    print("   " + HEADER + (DAGGER_HEADER if a["dagger_modes"] else ""))
     t_next = -math.inf
     t_end = rows[-1]["t"]
     for r in rows:

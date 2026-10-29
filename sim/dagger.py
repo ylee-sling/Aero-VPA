@@ -18,15 +18,21 @@ and the yaw rate likewise, saturated as the expert's commands (``ExpertControlle
 On the expert's own flight tau* follows the clock and the label is the recorded one; off it the label steers back
 onto the path, turns the camera to the direction of travel and keeps the reference's speed.
 
-Gate. The policy flies unless (``GateConfig``) the vehicle comes close to an obstacle (privileged clearance now or
-0.5 s ahead at the current velocity), sinks too low, leaves the corridor around the path, faces away from the
-path, misses its active waypoint or stops making progress. Then the expert takes over:
-    * if the straight line back to the path is clear and short, it flies the reference from tau* (time-indexed,
-      as the demonstrations) and the frames are still recorded;
-    * otherwise, and after a missed waypoint, it brakes (minimum-jerk stop), re-plans from where it stopped
-      through the remaining waypoints, turns to the new path and flies it. Braking, hovering, planning and turning
-      are not recorded.
-After --recover_s on the path (within 0.5 m, heading within 20 degrees) the policy gets control back.
+Gate. The policy flies unless (``GateConfig``) the vehicle would come close to an obstacle (privileged clearance
+along its current velocity over the reaction time plus the braking time), sinks too low, leaves the corridor
+around the path, faces away from the path, misses its active waypoint or stops making progress. Then the expert
+takes over:
+    * off the corridor, facing away or too low, when the straight line back to the path is clear and short: it
+      flies the reference from tau* and the frames are still recorded;
+    * near an obstacle, after a missed waypoint or a stall, or when the way back is blocked or long: it brakes
+      (minimum-jerk stop), backs away from the nearest obstacle to --backoff_clearance if it stopped closer,
+      re-plans from there through the remaining waypoints, turns to the new path and flies it. Braking, backing
+      off, hovering, planning and turning are not recorded.
+The expert's clock on its reference is governed: it runs with time but never more than lead_distance (1 m) ahead
+of the path point nearest the vehicle, so after a takeover mid-path (vehicle slow, reference fast) the reference
+waits for the vehicle instead of running away and pulling it across corners. While the expert flies, a clearance
+below expert_clearance makes it brake and re-plan as well. After --recover_s on the path (within 0.5 m, heading
+within 20 degrees, clear of obstacles) the policy gets control back.
 
 Every decision runs the policy as deployed (its chunks are only executed while it has control), so S_t carries the
 setpoint that was actually dispatched: the policy's own under its control (where a_bar and the label disagree)
@@ -53,8 +59,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import expert as E  # noqa: E402
 
 DAGGER_VERSION = "1.0.0"
-MODES = ("POLICY", "EXPERT", "BRAKE", "PLAN", "ALIGN")
+MODES = ("POLICY", "EXPERT", "BRAKE", "BACKOFF", "PLAN", "ALIGN")
 TRIGGERS = ("obstacle", "low", "off_path", "heading", "missed_waypoint", "stall")
+SOFT = ("low", "off_path", "heading")       # the expert flies back to the path (when the way is clear and short)
 Command = Tuple[np.ndarray, np.ndarray, float]                  # NED velocity, NED acceleration, yaw rate
 PlanFn = Callable[[np.ndarray, np.ndarray, float], "Future[E.MinSnapSpline]"]
 
@@ -63,8 +70,12 @@ PlanFn = Callable[[np.ndarray, np.ndarray, float], "Future[E.MinSnapSpline]"]
 class GateConfig:
     """When the expert takes over, and what is recorded (see the module docstring)."""
 
-    clearance: float = 0.5           # privileged clearance now or lookahead_s ahead (m); the planner keeps 0.6
-    lookahead_s: float = 0.5
+    clearance: float = 0.5           # predicted privileged clearance that makes the expert brake (m); the planner keeps 0.6
+    lookahead_s: float = 0.5         # shortest prediction horizon (s)
+    reaction_s: float = 0.3          # the prediction runs the current velocity for reaction_s + the braking time (s)
+    expert_clearance: float = 0.4    # while the expert flies its path: brake and re-plan below this clearance (m)
+    backoff_clearance: float = 0.8   # after braking closer than this to an obstacle, back away to it (m)
+    lead_distance: float = 1.0       # the expert's reference point runs at most this far ahead of the vehicle's (m)
     altitude: float = 0.8            # height above the home ground (m)
     distance: float = 1.5            # corridor half-width around the expert path (m)
     replan_distance: float = 3.0     # farther from the path: brake and re-plan rather than fly back (m)
@@ -117,6 +128,14 @@ class Reference:
     def advance(self, position: np.ndarray) -> float:
         self.tau = self.nearest(position)
         return self.tau
+
+    def lead_time(self, tau: float, distance: float, horizon: int = 500) -> float:
+        """The first reference time after ``tau`` at which the path lies ``distance`` (straight line) from p_ref(tau),
+        searched at most ``horizon`` samples ahead (10 s); the end of that window if the path stays closer."""
+        i = min(int(np.searchsorted(self.ts, float(tau) - 1e-9)), len(self.ts) - 1)
+        stop = min(len(self.ts), i + horizon)
+        j = np.nonzero(np.linalg.norm(self.ps[i:stop] - self.ps[i], axis=1) > distance)[0]
+        return float(self.ts[i + int(j[0])]) if j.size else float(self.ts[stop - 1])
 
     def position(self, tau: float) -> np.ndarray:
         return np.asarray(self.trajectory.spline.evaluate(float(tau)), dtype=np.float64)
@@ -232,8 +251,11 @@ class DaggerSupervisor:
         self.reference = Reference(trajectory, self.speed, self.waypoints, 1)
         self.next_reference: Optional[Reference] = None
         self.mode, self.mode_since = "POLICY", float(start_time)
-        self.expert: Optional[E.ExpertController] = None
+        self.tau_cmd = 0.0                                   # the expert's governed clock on its reference
         self.hold: Optional[E.ExpertController] = None
+        self.backoff_z = 0.0
+        self.expert_brakes = 0
+        self.backoffs = 0
         self.brake_v0, self.brake_t0 = np.zeros(3), float(start_time)
         self.plan_future: Optional[Future] = None
         self.plan_start = np.zeros(3)
@@ -268,10 +290,42 @@ class DaggerSupervisor:
         if tau >= self.progress_tau + 0.25 or dist <= self.progress_dist - 0.25:
             self.progress_time, self.progress_tau, self.progress_dist = float(now), tau, dist
 
+    def predicted_clearance(self, position: np.ndarray, velocity: np.ndarray) -> float:
+        """Smallest privileged clearance along the current velocity over the reaction time plus the braking time."""
+        if not len(self.world):
+            return math.inf
+        g = self.gate
+        horizon = max(g.lookahead_s, g.reaction_s + 1.5 * float(np.linalg.norm(velocity)) / g.brake_decel)
+        ts = np.linspace(0.0, horizon, 6)
+        return float(np.min(self.world.distance(position[None] + ts[:, None] * velocity[None])))
+
+    def away(self, position: np.ndarray, h: float = 0.05) -> np.ndarray:
+        """Unit horizontal direction away from the nearest obstacle (central differences of the distance field)."""
+        if not len(self.world):
+            return np.zeros(3)
+        steps = np.array([[h, 0.0, 0.0], [-h, 0.0, 0.0], [0.0, h, 0.0], [0.0, -h, 0.0]])
+        d = self.world.distance(position[None] + steps)
+        grad = np.array([d[0] - d[1], d[2] - d[3], 0.0]) / (2.0 * h)
+        n = float(np.linalg.norm(grad))
+        return grad / n if n > 1e-6 else np.zeros(3)
+
+    def _start_brake(self, now: float, velocity: np.ndarray, reason: str) -> None:
+        self.close_segment(f"takeover: {reason}")
+        self.brake_v0, self.brake_t0 = np.asarray(velocity, dtype=np.float64).copy(), float(now)
+        self._set_mode("BRAKE", now)
+
+    def _start_plan(self, now: float, position: np.ndarray, yaw: float) -> None:
+        self.hold = E.ExpertController(self.planner.hold(position, yaw), now, E.CommandLimits(speed_h=1.0))
+        self.plan_start = position.copy()
+        remaining = self.waypoints[min(max(self.m, 1), len(self.waypoints)) - 1:]
+        self.plan_future = self.plan(position.copy(), remaining, self.speed)
+        self.replans += 1
+        self._set_mode("PLAN", now)
+
     def trigger(self, now: float, position: np.ndarray, velocity: np.ndarray, yaw: float) -> Optional[str]:
         """Why the expert must take over now (``TRIGGERS``), or None."""
         g, ref = self.gate, self.reference
-        if len(self.world) and min(self._clearance(position), self._clearance(position + g.lookahead_s * velocity)) < g.clearance:
+        if self.predicted_clearance(position, velocity) < g.clearance:
             return "obstacle"
         if -position[2] < g.altitude:
             return "low"
@@ -296,9 +350,10 @@ class DaggerSupervisor:
     def control(self, now: float, position: np.ndarray, velocity: np.ndarray, yaw: float) -> Optional[Command]:
         """The expert's setpoint while it has control, or None while the policy flies."""
         now, p, v = float(now), np.asarray(position, dtype=np.float64), np.asarray(velocity, dtype=np.float64)
-        if self.last_now is not None:
-            self.time_in[self.mode] += max(0.0, now - self.last_now)
+        dt = 0.0 if self.last_now is None else max(0.0, now - self.last_now)
+        self.time_in[self.mode] += dt
         self.last_now = now
+        g = self.gate
         if self.mode in ("POLICY", "EXPERT"):
             self.reference.advance(p)
             self._track_progress(now, p)
@@ -309,31 +364,37 @@ class DaggerSupervisor:
             self.takeovers[reason] += 1
             ref = self.reference
             p_ref = ref.position(ref.tau)
-            if (reason not in ("missed_waypoint", "stall") and float(np.linalg.norm(p_ref - p)) <= self.gate.replan_distance
-                    and self._clear(p, p_ref)):
-                self.expert = ref.controller(now, ref.tau)
+            if reason in SOFT and float(np.linalg.norm(p_ref - p)) <= g.replan_distance and self._clear(p, p_ref):
+                self.tau_cmd = ref.tau
                 self._set_mode("EXPERT", now)
             else:
-                self.close_segment(f"takeover: {reason}")
-                self.brake_v0, self.brake_t0 = v.copy(), now
-                self._set_mode("BRAKE", now)
+                self._start_brake(now, v, reason)
         if self.mode == "EXPERT":
-            if now - self.mode_since >= self.gate.recover_s and self._on_track(p, yaw):
-                self.expert = None
+            ref = self.reference
+            self.tau_cmd = max(ref.tau, min(self.tau_cmd + dt, ref.lead_time(ref.tau, g.lead_distance)))
+            if self._clearance(p) < g.expert_clearance:
+                self.expert_brakes += 1
+                self._start_brake(now, v, "obstacle while the expert flies")
+            elif now - self.mode_since >= g.recover_s and self._on_track(p, yaw):
                 self.progress_time = now
                 self._set_mode("POLICY", now)
                 return None
-            return self.expert.command(now, p, yaw)
+            else:
+                return ref.controller(now, self.tau_cmd).command(now, p, yaw)
         if self.mode == "BRAKE":
-            vel, acc, t_b = braking(self.brake_v0, now - self.brake_t0, self.gate.brake_decel)
+            vel, acc, t_b = braking(self.brake_v0, now - self.brake_t0, g.brake_decel)
             if now - self.brake_t0 < t_b or float(np.linalg.norm(v)) > 0.3:
                 return vel, acc, 0.0
-            self.hold = E.ExpertController(self.planner.hold(p, yaw), now, E.CommandLimits(speed_h=1.0))
-            self.plan_start = p.copy()
-            remaining = self.waypoints[min(max(self.m, 1), len(self.waypoints)) - 1:]
-            self.plan_future = self.plan(p.copy(), remaining, self.speed)
-            self.replans += 1
-            self._set_mode("PLAN", now)
+            if self._clearance(p) < g.backoff_clearance:
+                self.backoff_z, self.backoffs = float(p[2]), self.backoffs + 1
+                self._set_mode("BACKOFF", now)
+            else:
+                self._start_plan(now, p, yaw)
+        if self.mode == "BACKOFF":
+            if self._clearance(p) >= g.backoff_clearance or now - self.mode_since > 4.0:
+                self._start_plan(now, p, yaw)
+            else:
+                return 0.5 * self.away(p) + np.array([0.0, 0.0, self.backoff_z - p[2]]), np.zeros(3), 0.0
         if self.mode == "PLAN":
             if self.plan_future is not None and self.plan_future.done():
                 future, self.plan_future = self.plan_future, None
@@ -360,10 +421,10 @@ class DaggerSupervisor:
             target = float(self.hold.trajectory.reference(np.inf)[3])
             if (abs(float(E.wrap_angle(target - yaw))) < 0.08 and now - self.mode_since > 0.5) or now - self.mode_since > 8.0:
                 self.reference, self.next_reference = self.next_reference, None
-                self.expert = self.reference.controller(now, 0.0)
+                self.reference.tau, self.tau_cmd = 0.0, 0.0
                 self.progress_time, self.progress_tau, self.progress_dist = now, 0.0, math.inf
                 self._set_mode("EXPERT", now)
-                return self.expert.command(now, p, yaw)
+                return self.reference.controller(now, 0.0).command(now, p, yaw)
             return self.hold.command(now, p, yaw)
         return None
 
@@ -377,9 +438,9 @@ class DaggerSupervisor:
         self.m = int(waypoint_index)
         p = np.asarray(position, dtype=np.float64)
         ref = self.reference
-        if self.mode == "EXPERT" and self.expert is not None:
-            controller, tau = "expert", float(self.expert.elapsed(stamp))
-            label = self.expert.chunk(stamp, p, yaw)
+        if self.mode == "EXPERT":
+            controller, tau = "expert", self.tau_cmd
+            label = ref.label(stamp, tau, p, yaw)
         elif self.mode == "POLICY":
             controller, tau = "policy", ref.nearest(p)
             p_ref = ref.position(tau)
@@ -445,6 +506,7 @@ class DaggerSupervisor:
         return {"dagger_frames_policy": self.frames["policy"], "dagger_frames_expert": self.frames["expert"],
                 "dagger_frames_skipped": self.frames["skipped"], "dagger_frames_discarded": self.frames["discarded"],
                 "dagger_segments": self.segments, "dagger_replans": self.replans,
+                "dagger_expert_brakes": self.expert_brakes, "dagger_backoffs": self.backoffs,
                 "dagger_takeovers": {k: int(self.takeovers.get(k, 0)) for k in TRIGGERS},
                 "dagger_time_s": {m: round(float(self.time_in.get(m, 0.0)), 2) for m in MODES},
                 "dagger_policy_share": float(self.time_in.get("POLICY", 0.0) / total) if total > 0 else None,
@@ -578,6 +640,64 @@ def _self_test() -> None:
     assert order[:5] == ["BRAKE", "PLAN", "ALIGN", "EXPERT", "POLICY"], order
     assert sup.replans == 1 and sup.reference.waypoint_times and min(sup.reference.waypoint_times) == 1
     assert sup.summary()["dagger_takeovers"]["off_path"] == 1
+
+    # ---- governed clock: an expert takeover with the vehicle held still never runs the reference away
+    fast = planner.plan(start, waypoints, 7.0, 0.0)
+    sup = DaggerSupervisor(world, planner, waypoints, 7.0, fast, 0.0, plan, None, {}, GateConfig())
+    v_mid = fast.reference(2.0)[1]
+    side = np.array([-v_mid[1], v_mid[0], 0.0]) / float(np.linalg.norm(v_mid[:2]))
+    p_mid = fast.reference(2.0)[0] + 2.2 * side                           # 2.2 m beside the path: off the corridor
+    sup.reference.tau = 2.0
+    cmds = [sup.control(t, p_mid, np.zeros(3), float(fast.reference(2.0)[3])) for t in np.arange(0.0, 5.0, 0.01)]
+    assert sup.mode == "EXPERT" and sup.takeovers["off_path"] == 1
+    tau_star = sup.reference.nearest(p_mid)
+    assert tau_star <= sup.tau_cmd <= sup.reference.lead_time(tau_star, 1.0) + 1e-9           # at most 1 m ahead
+    lead = float(np.linalg.norm(sup.reference.position(sup.tau_cmd) - sup.reference.position(tau_star)))
+    assert lead <= 1.0 + 0.2, lead
+    assert max(float(np.linalg.norm(c[0])) for c in cmds) <= 7.0 * math.sqrt(2) + 2.0           # saturated, not runaway
+
+    # ---- head-on at a trunk: the prediction brakes in time, backs off if close, re-plans; no collision
+    trunk = E.PrivilegedMap([E.Obstacle("cylinder", (6.0, 0.0, -3.0), radius=0.3, half_height=3.0)])
+    tplanner = E.ExpertPlanner(trunk)
+    goal = np.array([[12.0, 0.0, -2.5]])
+    sup = DaggerSupervisor(trunk, tplanner, goal, 3.0, tplanner.plan(start, goal, 3.0, 0.0), 0.0,
+                           lambda s, w, v: plan_now(tplanner, s, w, v), None, {}, GateConfig(distance=10.0, replan_distance=10.0))
+    vehicle = E.KinematicQuadrotor(start, 0.0)
+    seen, closest, t = [], math.inf, 0.0
+    for _ in range(4000):
+        cmd = sup.control(t, vehicle.p, vehicle.v, vehicle.yaw)
+        seen.append(sup.mode)
+        vel, acc, yr = cmd if cmd is not None else (np.array([2.0, 0.0, 0.0]), np.zeros(3), 0.0)   # straight at it
+        vehicle.step(0.01, vel, acc, yr)
+        closest = min(closest, float(trunk.distance(vehicle.p)))
+        t += 0.01
+        if sup.mode == "EXPERT" and "BRAKE" in seen:
+            break
+    order = [m for i, m in enumerate(seen) if (i == 0 or seen[i - 1] != m) and m != "PLAN"]   # planning is instant
+    assert sup.takeovers["obstacle"] == 1 and order == ["POLICY", "BRAKE", "ALIGN", "EXPERT"], order
+    assert sup.replans == 1 and closest > 1.0, closest                    # braked well before the trunk
+    # stopped close to the trunk: back away before planning (the planner needs 0.6 m at the start)
+    sup = DaggerSupervisor(trunk, tplanner, goal, 3.0, tplanner.plan(start, goal, 3.0, 0.0), 0.0,
+                           lambda s, w, v: plan_now(tplanner, s, w, v), None, {}, GateConfig())
+    p_close = np.array([5.3, 0.0, -2.5])                                  # 0.4 m from the trunk surface
+    sup._start_brake(0.0, np.zeros(3), "test")
+    t, vehicle = 0.0, E.KinematicQuadrotor(p_close, 0.0)
+    for _ in range(600):
+        cmd = sup.control(t, vehicle.p, vehicle.v, vehicle.yaw)
+        if sup.mode == "BACKOFF":
+            assert cmd is not None and float(cmd[0] @ np.array([-1.0, 0.0, 0.0])) > 0.4      # away from the trunk
+        vehicle.step(0.01, *(cmd if cmd is not None else (np.zeros(3), np.zeros(3), 0.0)))
+        t += 0.01
+        if sup.mode in ("PLAN", "ALIGN", "EXPERT"):
+            break
+    assert sup.backoffs == 1 and float(trunk.distance(sup.plan_start)) >= 0.8 - 1e-6 and sup.replans == 1
+
+    # ---- the expert itself too close (tracking error near a trunk): brake and re-plan
+    sup = DaggerSupervisor(trunk, tplanner, goal, 3.0, tplanner.plan(start, goal, 3.0, 0.0), 0.0,
+                           lambda s, w, v: plan_now(tplanner, s, w, v), None, {}, GateConfig())
+    sup._set_mode("EXPERT", 0.0)
+    assert sup.control(0.01, np.array([5.35, 0.0, -2.5]), np.array([1.0, 0.0, 0.0]), 0.0) is not None
+    assert sup.mode == "BRAKE" and sup.expert_brakes == 1 and sup.summary()["dagger_expert_brakes"] == 1
     print("dagger.py self-test passed")
 
 
