@@ -38,7 +38,9 @@ Options:
   --skip_flights      only cache, train and calibrate (the flights of this round are done)
   -h, --help
 Arguments after "--" are passed to fly_policy.py (e.g. -- --gate_distance 2.0); the flights use a mission timeout
-of 3 x the expert's duration + 30 s, since takeovers that re-plan cost several seconds each.
+of 3 x the expert's duration + 30 s, since takeovers that re-plan cost several seconds each, and end a mission only
+after 2 s without a decision (--camera_timeout; the default 0.5 s ended 10-14% of rounds 1 and 2 with three
+simulators running, while the expert's gate needs no camera and the policy brakes once its chunk is stale).
 EOF
 }
 
@@ -85,6 +87,7 @@ if [[ $SKIP_FLIGHTS -eq 0 ]]; then
         [[ ${#mine[@]} -gt 0 ]] || continue
         sim/evaluate_worlds.sh --instance "$i" --episodes "$MISSIONS" --results "${OUT}_i$i.jsonl" --tag "$TAG" \
             --log-dir "$LOGS" "$POLICY" "${mine[@]}" -- --dagger_dir "$OUT" --timeout_factor 3 --timeout_extra_s 30 \
+            --camera_timeout 2 \
             "${EXTRA[@]}" > "$LOGS/flights_i$i.log" 2>&1 &
         pids+=($!)
     done

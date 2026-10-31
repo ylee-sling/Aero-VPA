@@ -98,6 +98,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--expert_speed", type=float, default=3.0, help="v_h of the reference plan (timeout, time ratio)")
     p.add_argument("--timeout_factor", type=float, default=1.5)
     p.add_argument("--timeout_extra_s", type=float, default=15.0)
+    p.add_argument("--camera_timeout", type=float, default=0.5,
+                   help="end the mission (camera_timeout) after this long without a decision, simulation time (s): no "
+                        "frame arrived, or none had odometry bracketing its capture (the record's max_decision_gap_s)")
     p.add_argument("--return_speed", type=float, default=2.0, help="speed of the expert flight back home (m/s)")
     p.add_argument("--latency_bound", type=float, default=0.06, help="T_e2e^max of the braking envelope (s)")
     p.add_argument("--tracking_lag", type=float, default=0.15, help="T_trk of the flight controller (s)")
@@ -205,6 +208,7 @@ class Mission:
         policy.pipe.reset(None, torch.as_tensor(self.waypoints, dtype=torch.float32)[None], mission_start=self.t0)
         self.decisions = self.fallback_decisions = self.fallback_onsets = self.blind_decisions = 0
         self.dropped_frames = 0
+        self.max_decision_gap = 0.0                         # longest time without a decision (from the start)
         self.prev_fallback = False
         self.latency: List[float] = []
         self.age: List[float] = []
@@ -231,6 +235,7 @@ class Mission:
         the simulation time after the decision (decision age = capture to commit). With DAgger, the frame is then
         recorded with the expert's label (``dagger.DaggerSupervisor.on_frame``)."""
         p, dev = self.policy, self.policy.device
+        self.max_decision_gap = max(self.max_decision_gap, float(stamp) - self.last_frame)
         self.last_frame = max(self.last_frame, float(stamp))
         image16 = E.encode_rgbd(rgb, depth)                                   # exactly as recorded for training
         rgb8 = image16[..., :3].astype(np.uint8)
@@ -398,7 +403,7 @@ class Mission:
             return "success"
         if now > self.deadline:
             return "timeout"
-        if now - self.last_frame > 0.5 and now - self.t0 > 1.0:
+        if now - self.last_frame > getattr(self.args, "camera_timeout", 0.5) and now - self.t0 > 1.0:
             return "camera_timeout"
         return None
 
@@ -425,7 +430,8 @@ class Mission:
             "scale_mean": float(np.mean(self.scale)) if self.scale else None,
             "primitive_counts": self.primitives.tolist(), "decision_latency_ms": _stats_ms(self.latency),
             "decision_age_ms": _stats_ms(self.age), "max_setpoint_gap_s": self.max_setpoint_gap,
-            "dropped_frames": self.dropped_frames, "wall_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "dropped_frames": self.dropped_frames, "max_decision_gap_s": self.max_decision_gap,
+            "wall_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
             **(self.dagger.summary() if self.dagger is not None else {}),
         }
 
@@ -941,7 +947,7 @@ def run_ros(args: argparse.Namespace) -> int:
                 v_cmd, a_ff, yr = self.mission.command(now, pos, vel, yaw)
                 self.publish_setpoint(now, v_cmd, a_ff, yr)
                 reason = self.mission.observe(now, pos, vel)
-                if reason is None and now - self.last_frame_sim > 0.5 and now - self.mission.t0 > 1.0:
+                if reason is None and now - self.last_frame_sim > self.args.camera_timeout and now - self.mission.t0 > 1.0:
                     reason = "camera_timeout"
                 if reason is not None:
                     self.finish_mission(reason, now, pos, yaw)
@@ -1110,6 +1116,16 @@ def _self_test() -> None:
                                           "--trace", trace_dir])) == 0
         records = [json.loads(line) for line in open(results, encoding="utf-8")]
         assert [(r["tag"], r["episode"]) for r in records] == [("policy.pt", 0), ("policy.pt", 1), ("again", 2)]
+        assert all(0.0 < r["max_decision_gap_s"] < 0.5 for r in records), [r["max_decision_gap_s"] for r in records]
+        # --camera_timeout: frames 0.8 s apart end a mission after 0.5 s without a decision, not after 2 s
+        slow = os.path.join(tmp, "slow.jsonl")
+        for limit in ("0.5", "2"):
+            assert run_dry(parse_args(base[:-4] + ["--results", slow, "--device", "cpu", "--episodes", "1",
+                                                   "--episode_start", "3", "--camera_timeout", limit]),
+                           camera_rate=1.25) == 0
+        fast, patient = [json.loads(line) for line in open(slow, encoding="utf-8")]
+        assert fast["termination"] == "camera_timeout" and patient["termination"] != "camera_timeout", (fast, patient)
+        assert 0.7 < patient["max_decision_gap_s"] < 0.9, patient["max_decision_gap_s"]
         # --trace: the mission record, then one row per decision
         assert "trace" not in records[0] and os.path.isfile(records[2]["trace"])
         assert os.path.basename(records[2]["trace"]) == "again_synthetic_e002.jsonl"
