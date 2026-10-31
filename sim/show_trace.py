@@ -15,6 +15,13 @@ the closest approach to every waypoint; a timeline every --every seconds and eve
 seconds. --svg draws the path from above (trunks from the world's JSON sidecar, waypoints, blind decisions)
 and the speeds, clearance and sigma_bar over time.
 
+--response fits the vehicle's horizontal velocity response to the setpoints that were dispatched (all traces
+pooled, then by who flew): v' = k a_ff(t - d) + (v_sp(t - d) - v) / tau, at most 7 m/s^2, simulated over 1 s windows
+from the flown velocity. It reports the delay d, the time constant tau and the share k of the acceleration
+feed-forward that the vehicle follows, and how well the closed-loop prediction of sim/dagger.py (d 0.2 s, tau
+0.5 s, k 1) and the same without feed-forward match. Traces before 2026-10-31 do not record the feed-forward
+(setpoint_acc); k is then not identifiable and is reported as "-".
+
 Angles are degrees: bearings in the heading frame (positive to the right), azimuth / elevation of u_t in the
 camera (right / up positive). Primitives: CRU(ISE) LAT(ERAL_AVOID) VER(TICAL_AVOID) YAW(_SCAN) APP(ROACH)
 BRK (BRAKE_HOVER). Modes: TRACK, BRAKE, HOLD.
@@ -46,6 +53,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--window", type=float, default=None, help="timeline of the last seconds only (default: all)")
     p.add_argument("--svg", default=None, help="draw the mission (one trace)")
     p.add_argument("--world_json", default=None, help="world sidecar for the trunks (default: from the record)")
+    p.add_argument("--response", action="store_true", help="fit the velocity response to the dispatched setpoints")
     p.add_argument("--self-test", dest="self_test", action="store_true")
     args = p.parse_args(argv)
     if not args.self_test and not args.traces:
@@ -361,10 +369,165 @@ def svg(record: Dict[str, Any], rows: List[Dict[str, Any]], world_json: Optional
         f.write("\n".join(out) + "\n")
 
 
+# ---------------------------------------------------------------------------------------------
+# --response: the vehicle's velocity response to the dispatched setpoints
+# ---------------------------------------------------------------------------------------------
+RESPONSE_MODEL = (0.2, 0.5, 1.0)          # delay_s, response_s and feed-forward share of sim/dagger.py's prediction
+
+
+def response_samples(rows: List[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:
+    """Flown horizontal velocity at the frame stamps and the last dispatched setpoint (horizontal velocity and
+    acceleration feed-forward) at about the time it went out (stamp + age - compute), with who dispatched it."""
+    keep = [r for r in rows if r.get("setpoint") is not None and int(r.get("mode", -1)) != -1]
+    if len(keep) < 10:
+        return None
+    t = np.array([float(r["t"]) for r in keep])
+    out = np.array([max(0.0, float(r.get("age_ms") or 0.0) - float(r.get("compute_ms") or 0.0)) / 1e3 for r in keep])
+    return {"t": t, "v": np.array([r["v"][:2] for r in keep], dtype=np.float64),
+            "t_sp": t + out, "sp": np.array([r["setpoint"][:2] for r in keep], dtype=np.float64),
+            "ff": np.array([(r.get("setpoint_acc") or [0.0, 0.0])[:2] for r in keep], dtype=np.float64),
+            "has_ff": np.array([r.get("setpoint_acc") is not None for r in keep]),
+            "expert": np.array([int(r.get("mode", -1)) == -2 for r in keep])}
+
+
+def response_windows(samples: Dict[str, np.ndarray], window: float = 1.0, step: float = 0.25, lead: float = 0.6,
+                     max_gap: float = 0.2) -> List[Tuple[int, int]]:
+    """(first, last) row indices of the fitting windows: ``window`` s of rows without a gap above ``max_gap``,
+    preceded by ``lead`` s of setpoints (the largest delay tried), starting at least ``step`` s apart."""
+    t = samples["t"]
+    breaks = np.concatenate([[0], np.nonzero(np.diff(t) > max_gap)[0] + 1, [len(t)]])
+    out: List[Tuple[int, int]] = []
+    for a, b in zip(breaks[:-1], breaks[1:], strict=True):
+        next_start = t[a] + lead
+        for i in range(a, b):
+            if t[i] < next_start:
+                continue
+            if t[i] + window > t[b - 1] + 1e-9:
+                break
+            j = a + int(np.searchsorted(t[a:b], t[i] + window, side="right")) - 1
+            if j > i:
+                out.append((i, j))
+            next_start = t[i] + step
+    return out
+
+
+def fit_response(groups: Sequence[Tuple[Dict[str, np.ndarray], List[Tuple[int, int]]]], dt: float = 0.01,
+                 window: float = 1.0, a_max: float = 7.0, delays: Optional[np.ndarray] = None,
+                 taus: Optional[np.ndarray] = None, shares: Sequence[float] = (0.0, 0.25, 0.5, 0.75, 1.0),
+                 extra: Sequence[Tuple[float, float, float]] = (RESPONSE_MODEL, (0.2, 0.5, 0.0))) -> Dict[str, Any]:
+    """Grid search of (delay, tau, share) minimising the squared error of the simulated horizontal velocity at the
+    rows of every window (simulation from the flown velocity at the window start). Returns the best point, its
+    RMSE (m/s) and the RMSE of each ``extra`` point."""
+    delays = np.round(np.arange(0.0, 0.52, 0.02), 3) if delays is None else delays
+    taus = np.round(np.arange(0.2, 1.25, 0.05), 3) if taus is None else taus
+    steps = int(round(window / dt))
+    rel = dt * np.arange(1, steps + 1)                                           # simulation times after t0
+    starts, v0, eval_j, eval_v, mask, owners = [], [], [], [], [], []
+    for gi, (smp, wins) in enumerate(groups):
+        for i, j in wins:
+            t0 = smp["t"][i]
+            idx = np.arange(i + 1, j + 1)
+            starts.append(t0)
+            v0.append(smp["v"][i])
+            eval_j.append(np.clip(np.round((smp["t"][idx] - t0) / dt).astype(int) - 1, 0, steps - 1))
+            eval_v.append(smp["v"][idx])
+            owners.append(gi)
+    n = len(starts)
+    if n == 0:
+        return {"windows": 0}
+    width = max(len(e) for e in eval_j)
+    ej = np.zeros((n, width), dtype=int)
+    ev = np.zeros((n, width, 2))
+    mask = np.zeros((n, width))
+    for w in range(n):
+        k = len(eval_j[w])
+        ej[w, :k], ev[w, :k], mask[w, :k] = eval_j[w], eval_v[w], 1.0
+    v0_arr = np.array(v0)
+    owners_arr = np.array(owners)
+    rows = np.arange(n)[:, None]
+
+    def inputs(d: float) -> Tuple[np.ndarray, np.ndarray]:
+        u, f = np.zeros((n, steps, 2)), np.zeros((n, steps, 2))
+        for gi, (smp, _) in enumerate(groups):
+            sel = np.nonzero(owners_arr == gi)[0]
+            if sel.size == 0:
+                continue
+            q = (np.array(starts)[sel, None] + rel[None] - d).ravel()
+            for c in range(2):
+                u[sel, :, c] = np.interp(q, smp["t_sp"], smp["sp"][:, c]).reshape(sel.size, steps)
+                f[sel, :, c] = np.interp(q, smp["t_sp"], smp["ff"][:, c]).reshape(sel.size, steps)
+        return u, f
+
+    def sse(u: np.ndarray, f: np.ndarray, tau: float, share: float) -> float:
+        v = v0_arr.copy()
+        hist = np.empty((n, steps, 2))
+        for s in range(steps):
+            acc = share * f[:, s] + (u[:, s] - v) / tau
+            norm = np.linalg.norm(acc, axis=1, keepdims=True)
+            acc *= np.minimum(1.0, a_max / np.maximum(norm, 1e-9))
+            v = v + dt * acc
+            hist[:, s] = v
+        err = hist[rows, ej] - ev
+        return float(np.sum(mask[..., None] * err * err))
+
+    count = float(mask.sum())
+    best = (math.inf, 0.0, 0.0, 0.0)
+    for d in delays:
+        u, f = inputs(float(d))
+        for tau in taus:
+            for share in shares:
+                e = sse(u, f, float(tau), float(share))
+                if e < best[0]:
+                    best = (e, float(d), float(tau), float(share))
+    out = {"windows": n, "points": int(count), "delay": best[1], "tau": best[2], "share": best[3],
+           "rmse": math.sqrt(best[0] / count)}
+    for d, tau, share in extra:
+        u, f = inputs(d)
+        out[(d, tau, share)] = math.sqrt(sse(u, f, tau, share) / count)
+    return out
+
+
+def response_report(paths: Sequence[str], delays: Optional[np.ndarray] = None,
+                    taus: Optional[np.ndarray] = None) -> Dict[str, Dict[str, Any]]:
+    """Print the --response fit for the pooled traces and by who flew; returns the fits."""
+    traces = []
+    for path in paths:
+        _, rows = load_trace(path)
+        smp = response_samples(rows)
+        if smp is not None:
+            traces.append(smp)
+    has_ff = bool(traces) and all(bool(s["has_ff"].all()) for s in traces)
+    shares = (0.0, 0.25, 0.5, 0.75, 1.0) if has_ff else (0.0,)
+    fits: Dict[str, Dict[str, Any]] = {}
+    for name, who in (("all", None), ("expert", True), ("policy", False)):
+        groups = []
+        for smp in traces:
+            wins = [(i, j) for i, j in response_windows(smp)
+                    if who is None or bool(np.all(smp["expert"][i:j + 1] == who))]
+            groups.append((smp, wins))
+        fits[name] = fit_response(groups, shares=shares, delays=delays, taus=taus)
+    m = RESPONSE_MODEL
+    print(f"velocity response (horizontal), {len(traces)} traces, 1 s windows from the flown velocity"
+          + ("" if has_ff else "; no feed-forward recorded (traces before 2026-10-31): share not identifiable"))
+    print(f"   {'flown by':8s} {'windows':>7s} {'delay s':>8s} {'tau s':>6s} {'ff share':>8s} {'rmse m/s':>9s}   "
+          f"prediction {m[0]:.1f}/{m[1]:.1f}/{m[2]:.0f}   without ff {m[0]:.1f}/{m[1]:.1f}/0")
+    for name, fit in fits.items():
+        if not fit.get("windows"):
+            print(f"   {name:8s} {0:7d}")
+            continue
+        share = "%.2f" % fit["share"] if has_ff else "-"
+        print(f"   {name:8s} {fit['windows']:7d} {fit['delay']:8.2f} {fit['tau']:6.2f} {share:>8s} "
+              f"{fit['rmse']:9.3f}   {fit[m]:16.3f}   {fit[(m[0], m[1], 0.0)]:14.3f}")
+    return fits
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     if args.self_test:
         _self_test()
+        return 0
+    if args.response:
+        response_report(args.traces)
         return 0
     for path in args.traces:
         record, rows = load_trace(path)
@@ -415,6 +578,45 @@ def _self_test() -> None:
         assert text.startswith("<svg") and text.rstrip().endswith("</svg>") and "polyline" in text
         assert main([path, "--brief"]) == 0
         assert main([path, "--every", "0.1", "--last", "0", "--window", "0.5"]) == 0
+    # --response: a vehicle with a 0.24 s delay, a 0.6 s time constant and a quarter of the feed-forward
+    rng = np.random.default_rng(3)
+    d_true, tau_true, k_true, fine = 0.24, 0.6, 0.25, 0.001
+
+    def sp_ff(t: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        sp = np.stack([2.5 * np.sin(0.9 * t) + np.sin(2.3 * t + 1.0), 2.0 * np.cos(0.7 * t) + 0.8 * np.sin(1.9 * t)], -1)
+        ff = np.stack([2.25 * np.cos(0.9 * t) + 2.3 * np.cos(2.3 * t + 1.0), -1.4 * np.sin(0.7 * t) + 1.52 * np.cos(1.9 * t)], -1)
+        return sp, ff
+
+    grid = np.arange(0.0, 24.0, fine)
+    sp_g, ff_g = sp_ff(np.maximum(grid - d_true, 0.0))
+    vel = np.zeros((len(grid), 2))
+    for i in range(1, len(grid)):
+        acc = k_true * ff_g[i - 1] + (sp_g[i - 1] - vel[i - 1]) / tau_true
+        vel[i] = vel[i - 1] + fine * acc * min(1.0, 7.0 / max(float(np.linalg.norm(acc)), 1e-9))
+    stamps = np.cumsum(rng.uniform(0.025, 0.04, 800))
+    stamps = stamps[stamps < 23.5]
+    sp_r, ff_r = sp_ff(stamps + 0.015)                                    # dispatched 15 ms after the stamp
+    flown = np.stack([np.interp(stamps, grid, vel[:, 0]), np.interp(stamps, grid, vel[:, 1])], -1)
+    trace = [{"t": float(t), "v": [float(v[0]), float(v[1]), 0.0], "setpoint": [float(a[0]), float(a[1]), 0.0, 0.0],
+              "setpoint_acc": [float(c[0]), float(c[1]), 0.0], "age_ms": 35.0, "compute_ms": 20.0,
+              "mode": -2 if t < 12.0 else 0}
+             for t, v, a, c in zip(stamps, flown, sp_r, ff_r, strict=True)]
+    smp = response_samples(trace)
+    assert smp is not None and bool(smp["has_ff"].all()) and abs(float(smp["t_sp"][0] - smp["t"][0]) - 0.015) < 1e-9
+    wins = response_windows(smp)
+    assert wins and all(smp["t"][j] - smp["t"][i] <= 1.0 + 1e-9 and smp["t"][i] >= 0.6 for i, j in wins)
+    fit = fit_response([(smp, wins)], delays=np.array([0.16, 0.2, 0.24, 0.28, 0.32]),
+                       taus=np.array([0.4, 0.5, 0.6, 0.7, 0.8]), shares=(0.0, 0.25, 0.5, 1.0))
+    assert (fit["delay"], fit["tau"], fit["share"]) == (0.24, 0.6, 0.25), fit
+    assert fit["rmse"] < 0.02 and fit[RESPONSE_MODEL] > 5.0 * fit["rmse"], fit           # the true model fits best
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "r.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for item in [{"kind": "mission", "tag": "p"}, *({"kind": "decision", **r} for r in trace)]:
+                f.write(json.dumps(item) + "\n")
+        fits = response_report([path], delays=np.array([0.2, 0.24]), taus=np.array([0.5, 0.6]))
+        assert fits["expert"]["windows"] > 0 and fits["policy"]["windows"] > 0
+        assert fits["all"]["windows"] >= fits["expert"]["windows"] + fits["policy"]["windows"]
     print("show_trace.py self-test passed")
 
 
