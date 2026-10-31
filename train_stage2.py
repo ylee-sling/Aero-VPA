@@ -55,7 +55,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from cache_latents import cache_is_current, cache_path, complete_episodes
+from cache_latents import cache_path, complete_episodes, find_cache
 from checkpoint import atomic_torch_save, build_policy_modules, config_from_dict, environment_info, load_checkpoint, \
     make_checkpoint, save_checkpoint
 from config import PRIMITIVES, STATE_GROUPS
@@ -86,11 +86,13 @@ class LatentStore:
     def __init__(self, sources: Sequence[str], latent_dir: str, checkpoint_id: str, episode_filter: Any = None,
                  only_successful: bool = True) -> None:
         chosen = []                                                          # (source, episode, frames, instruction)
+        caches: Dict[str, str] = {}
         for source in sources:
-            cache = cache_path(latent_dir, source)
-            if not cache_is_current(cache, source, checkpoint_id):
-                raise ValueError(f"{cache} is missing or was not built from stage-1 checkpoint {checkpoint_id[:8]} "
-                                 f"and the current {os.path.basename(source)}: run cache_latents.py first")
+            cache = find_cache(latent_dir, source, checkpoint_id)
+            if cache is None:
+                raise ValueError(f"{cache_path(latent_dir, source)} is missing or was not built from stage-1 checkpoint "
+                                 f"{checkpoint_id[:8]} and the current {source}: run cache_latents.py first")
+            caches[source] = cache
             with h5py.File(source, "r") as f:
                 for name in complete_episodes(f):
                     attrs = dict(f[name].attrs)
@@ -109,7 +111,7 @@ class LatentStore:
         self.episode_names = [f"{os.path.basename(c[0])}:{c[1]}" for c in chosen]
         self.sources = sorted({c[0] for c in chosen})
         first = chosen[0]
-        with h5py.File(cache_path(latent_dir, first[0]), "r") as cf:
+        with h5py.File(caches[first[0]], "r") as cf:
             d = cf[first[1]]["z"].shape[1]
         arrays = {
             "z": np.empty((n, d), np.float32), "z_hat": np.empty((n, d), np.float32),
@@ -119,7 +121,7 @@ class LatentStore:
         }
         row = 0
         for k, (source, name, frames, instruction) in enumerate(chosen):
-            with h5py.File(source, "r") as f, h5py.File(cache_path(latent_dir, source), "r") as cf:
+            with h5py.File(source, "r") as f, h5py.File(caches[source], "r") as cf:
                 ep, cep = f[name], cf[name]
                 if cep["z"].shape[0] != frames:
                     raise ValueError(f"cache of {source}:{name} has {cep['z'].shape[0]} frames, the episode {frames}")

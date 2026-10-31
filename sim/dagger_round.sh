@@ -92,22 +92,39 @@ if [[ $SKIP_FLIGHTS -eq 0 ]]; then
 fi
 ls "$OUT"/*.hdf5 > /dev/null 2>&1 || { log "no DAgger frames in $OUT"; exit 1; }
 
-# ---- 2. latents of the new frames, in the cache directory of the demonstrations
+# ---- 2. latents of the new frames, in the cache directory of the demonstrations (whose current caches are kept;
+# caches lost are rebuilt: before 2026-10-31, dagger_r<N>/<world>.hdf5 overwrote the cache of data/<world>.hdf5)
 if [[ -z "$LATENTS" ]]; then
     LATENTS=$("$PYTHON" - "$STAGE1" "$DATA" <<'PY'
 import glob, os, sys
-from cache_latents import cache_is_current, cache_path
+import h5py
+from cache_latents import find_cache
 from checkpoint import load_checkpoint
 from dataset import expand_paths
 cid = load_checkpoint(sys.argv[1])["checkpoint_id"]
 src = expand_paths(sys.argv[2])[0]
-print(next((d for d in sorted(glob.glob("latents*")) if os.path.isdir(d) and cache_is_current(cache_path(d, src), src, cid)), ""))
+
+
+def of_stage1(d):
+    for p in sorted(glob.glob(os.path.join(d, "*.latents.hdf5")))[:50]:
+        try:
+            with h5py.File(p, "r") as f:
+                if f.attrs.get("stage1_checkpoint_id") == cid:
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+dirs = [d for d in sorted(glob.glob("latents*")) if os.path.isdir(d)]
+print(next((d for d in dirs if find_cache(d, src, cid)), next((d for d in dirs if of_stage1(d)), "")))
 PY
 )
 fi
 [[ -n "$LATENTS" ]] || { log "no latent cache of $STAGE1 found; pass --latents"; exit 1; }
-log "caching latents of $OUT in $LATENTS"
-"$PYTHON" cache_latents.py "$STAGE1" "$OUT/*.hdf5" --out_dir "$LATENTS" > "$LOGS/cache.log" 2>&1 || { log "cache_latents failed"; exit 1; }
+log "caching latents of $DATA and $OUT in $LATENTS"
+"$PYTHON" cache_latents.py "$STAGE1" "$DATA" "$OUT/*.hdf5" --out_dir "$LATENTS" > "$LOGS/cache.log" 2>&1 \
+    || { log "cache_latents failed"; exit 1; }
 
 # ---- 3. stage (ii) on the demonstrations and every round so far, trained like --like
 TRAIN_ARGS=$("$PYTHON" - "$LIKE" <<'PY'

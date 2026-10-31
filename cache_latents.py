@@ -6,7 +6,9 @@ cache_latents.py -- Run the frozen stage-(i) networks once over every frame (pre
 
     python cache_latents.py checkpoints/stage1.pt "data/*.hdf5" --out_dir latents
 
-For every demonstration file ``data/X.hdf5`` this writes ``latents/X.latents.hdf5``:
+For every demonstration file ``data/X.hdf5`` this writes ``latents/data__X.latents.hdf5`` (``<directory>__<name>``:
+the DAgger rounds record the worlds of the demonstrations under the same names, dagger_r1/X.hdf5; caches named
+``X.latents.hdf5``, as before 2026-10-31, are still used while they are current for their source):
 
     /                         attrs: schema, schema_version, stage1_checkpoint_id, gamma_bar_star, source_file,
                                      source_bytes, source_mtime_ns, primitive ("expert")
@@ -39,15 +41,31 @@ from checkpoint import load_checkpoint, load_stage1_modules
 from dataset import expand_paths
 from train_stage1 import autocast, pick_device
 
-__all__ = ["CACHE_SCHEMA", "CACHE_VERSION", "cache_path", "cache_is_current", "FrameChunks", "cache_latents",
-           "parse_args"]
+__all__ = ["CACHE_SCHEMA", "CACHE_VERSION", "cache_path", "legacy_cache_path", "find_cache", "cache_is_current",
+           "FrameChunks", "cache_latents", "parse_args"]
 
 CACHE_SCHEMA = "aero-vpa/latent-cache"
 CACHE_VERSION = "1.0.0"
 
 
 def cache_path(out_dir: str, source: str) -> str:
+    """Where the cache of ``source`` is written: ``<directory>__<name>.latents.hdf5``, so that data/X.hdf5 and
+    dagger_r1/X.hdf5 (the same world) get separate caches."""
+    folder = os.path.basename(os.path.dirname(os.path.abspath(source)))
+    return os.path.join(out_dir, f"{folder}__{os.path.splitext(os.path.basename(source))[0]}.latents.hdf5")
+
+
+def legacy_cache_path(out_dir: str, source: str) -> str:
+    """The name of caches written before 2026-10-31 (``<name>.latents.hdf5``), shared by sources of the same name."""
     return os.path.join(out_dir, os.path.splitext(os.path.basename(source))[0] + ".latents.hdf5")
+
+
+def find_cache(out_dir: str, source: str, checkpoint_id: str) -> Optional[str]:
+    """The current cache of ``source`` in ``out_dir`` (``cache_path``, else ``legacy_cache_path``), or None."""
+    for path in (cache_path(out_dir, source), legacy_cache_path(out_dir, source)):
+        if cache_is_current(path, source, checkpoint_id):
+            return path
+    return None
 
 
 def _source_signature(source: str) -> Tuple[int, int]:
@@ -151,8 +169,11 @@ def cache_latents(args: argparse.Namespace) -> List[str]:
     normalizer = cfg.build_rgbd_normalizer().to(device)
     ckpt_id = ckpt["checkpoint_id"]
     sources = expand_paths(args.data)
+    names = [cache_path(args.out_dir, s) for s in sources]
+    if len(set(names)) < len(names):
+        raise ValueError("sources in different directories of the same name would share caches")
     os.makedirs(args.out_dir, exist_ok=True)
-    todo = [s for s in sources if args.force or not cache_is_current(cache_path(args.out_dir, s), s, ckpt_id)]
+    todo = [s for s in sources if args.force or find_cache(args.out_dir, s, ckpt_id) is None]
     print(f"[cache] {len(sources)} files, {len(sources) - len(todo)} current, {len(todo)} to build "
           f"(stage-1 checkpoint {ckpt_id[:8]}, gamma* = {gamma:.4f}, device {device})", flush=True)
     items = chunk_items(todo, args.chunk)
@@ -204,7 +225,7 @@ def cache_latents(args: argparse.Namespace) -> List[str]:
             print(f"[cache] {frames} frames encoded, {files_done}/{len(todo)} files", flush=True)
     finish()
     print(f"[cache] done: {frames} frames in {files_done} files -> {args.out_dir}", flush=True)
-    return [cache_path(args.out_dir, s) for s in sources]
+    return [find_cache(args.out_dir, s, ckpt_id) or cache_path(args.out_dir, s) for s in sources]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -225,7 +246,8 @@ def _self_test() -> None:
         out_dir = os.path.join(tmp, "latents")
         args = parse_args([ckpt_path, *files, "--out_dir", out_dir, "--chunk", "7", "--num_workers", "2", "--device", "cpu"])
         caches = cache_latents(args)
-        assert [os.path.basename(c) for c in caches] == ["a.latents.hdf5", "b.latents.hdf5"]
+        folder = os.path.basename(tmp)
+        assert [os.path.basename(c) for c in caches] == [f"{folder}__a.latents.hdf5", f"{folder}__b.latents.hdf5"]
         assert not [f for f in os.listdir(out_dir) if f.endswith(".tmp")]
 
         # cached values equal a direct evaluation of the frozen networks
@@ -265,6 +287,25 @@ def _self_test() -> None:
         cache_latents(args)
         assert cache_is_current(caches[1], files[1], load_checkpoint(ckpt_path)["checkpoint_id"])
         assert math.isfinite(gamma)
+
+        # a DAgger round records a world of the demonstrations under the same name (dagger_r1/a.hdf5): separate
+        # caches, and neither overwrites the other; a current cache under the old shared name is still used
+        cid = load_checkpoint(ckpt_path)["checkpoint_id"]
+        r1 = os.path.join(tmp, "dagger_r1")
+        os.makedirs(r1)
+        r1_files = make_demo_data(r1, {"a.hdf5": 1}, frames=20)
+        mtimes = [os.stat(c).st_mtime_ns for c in caches]
+        both = cache_latents(parse_args([ckpt_path, *files, *r1_files, "--out_dir", out_dir, "--chunk", "7",
+                                         "--num_workers", "0", "--device", "cpu"]))
+        assert os.path.basename(both[2]) == "dagger_r1__a.latents.hdf5" and [os.stat(c).st_mtime_ns for c in caches] == mtimes
+        assert all(find_cache(out_dir, s, cid) == c for s, c in zip(files + r1_files, both, strict=True))
+        os.replace(both[2], legacy_cache_path(out_dir, r1_files[0]))       # as round 1 wrote it (2026-10-31)
+        assert find_cache(out_dir, r1_files[0], cid) == legacy_cache_path(out_dir, r1_files[0])
+        assert find_cache(out_dir, files[0], cid) == caches[0]               # the legacy name is not the demo's
+        os.remove(caches[0])
+        assert find_cache(out_dir, files[0], cid) is None                   # ... so a lost demo cache is rebuilt
+        cache_latents(args)
+        assert find_cache(out_dir, files[0], cid) == caches[0]
     print("cache_latents.py self-test passed")
 
 
