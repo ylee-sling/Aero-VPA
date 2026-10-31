@@ -378,7 +378,7 @@ def svg(record: Dict[str, Any], rows: List[Dict[str, Any]], world_json: Optional
 # ---------------------------------------------------------------------------------------------
 # --response: the vehicle's velocity response to the dispatched setpoints
 # ---------------------------------------------------------------------------------------------
-RESPONSE_MODEL = (0.2, 0.5, 1.0)          # delay_s, response_s and feed-forward share of sim/dagger.py's prediction
+RESPONSE_MODEL = (0.24, 0.5, 1.0)         # delay_s, response_s and feed-forward share of sim/dagger.py's prediction
 
 
 def response_samples(rows: List[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:
@@ -420,7 +420,8 @@ def response_windows(samples: Dict[str, np.ndarray], window: float = 1.0, step: 
 def fit_response(groups: Sequence[Tuple[Dict[str, np.ndarray], List[Tuple[int, int]]]], dt: float = 0.01,
                  window: float = 1.0, a_max: float = 7.0, delays: Optional[np.ndarray] = None,
                  taus: Optional[np.ndarray] = None, shares: Sequence[float] = (0.0, 0.25, 0.5, 0.75, 1.0),
-                 extra: Sequence[Tuple[float, float, float]] = (RESPONSE_MODEL, (0.2, 0.5, 0.0))) -> Dict[str, Any]:
+                 extra: Sequence[Tuple[float, float, float]] = (RESPONSE_MODEL, RESPONSE_MODEL[:2] + (0.0,))
+                 ) -> Dict[str, Any]:
     """Grid search of (delay, tau, share) minimising the squared error of the simulated horizontal velocity at the
     rows of every window (simulation from the flown velocity at the window start). Returns the best point, its
     RMSE (m/s) and the RMSE of each ``extra`` point."""
@@ -516,7 +517,7 @@ def response_report(paths: Sequence[str], delays: Optional[np.ndarray] = None,
     print(f"velocity response (horizontal), {len(traces)} traces, 1 s windows from the flown velocity"
           + ("" if has_ff else "; no feed-forward recorded (traces before 2026-10-31): share not identifiable"))
     print(f"   {'flown by':8s} {'windows':>7s} {'delay s':>8s} {'tau s':>6s} {'ff share':>8s} {'rmse m/s':>9s}   "
-          f"prediction {m[0]:.1f}/{m[1]:.1f}/{m[2]:.0f}   without ff {m[0]:.1f}/{m[1]:.1f}/0")
+          f"prediction {m[0]:.2f}/{m[1]:.1f}/{m[2]:.0f}   without ff {m[0]:.2f}/{m[1]:.1f}/0")
     for name, fit in fits.items():
         if not fit.get("windows"):
             print(f"   {name:8s} {0:7d}")
@@ -630,7 +631,8 @@ def prediction_report(paths: Sequence[str]) -> Dict[str, Any]:
           f"{int((kept & (flown < COLLISION_CLEARANCE)).sum())})")
     p95 = float(np.percentile(opt, 95))
     print(f"   a threshold covering 95% of these errors: {COLLISION_CLEARANCE} + {p95:.2f} = "
-          f"{COLLISION_CLEARANCE + p95:.2f} m (now 0.45 m in flight, 0.40 m when already inside, 0.50 m at takeovers)")
+          f"{COLLISION_CLEARANCE + p95:.2f} m (now 0.45 m in flight, 0.40 m when already inside, 0.50 m at takeovers, "
+          "each + 0.06 m per m/s of predicted speed)")
     return {"checks": len(checks), "p95": p95, "misses": int(miss.sum())}
 
 

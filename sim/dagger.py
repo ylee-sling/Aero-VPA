@@ -26,9 +26,9 @@ at rest, a fixed point for a policy flying from there, so the policy takes over 
 slow start (``Reference.launch``), as after every takeover.
 
 Gate. The policy flies unless (``GateConfig``) the vehicle would come close to an obstacle (privileged clearance
-along its current velocity over the reaction time plus the braking time), sinks too low, leaves the corridor
-around the path, faces away from the path, misses its active waypoint or stops making progress. Then the expert
-takes over:
+along its current velocity over the reaction time plus the braking time, and at least lookahead_m ahead), sinks
+too low, leaves the corridor around the path, faces away from the path, misses its active waypoint or stops making
+progress. Then the expert takes over:
     * when the way back to the path is short and stays clear of obstacles (the expert's own closed loop from the
       current state, predicted over rollout_s, keeps the gate clearance, if need be slowed down by the governor
       below): it flies the reference from tau* and the frames are still recorded. Near an obstacle too: on its path
@@ -46,11 +46,19 @@ law on the governed clock, a dead time delay_s, then a first-order velocity resp
 as PX4's velocity loop). When it would come closer than expert_clearance to an obstacle, ``choose`` compares three
 ways on by their predicted clearance: flying on, slowing down along the path, and a straight minimum-jerk stop.
 Slowing down is the speed governor: the reference runs at the clock rate r = cap / |v_ref| <= 1 (velocity r v_ref,
-acceleration r^2 a_ref, the correction towards the path at full gain), with cap falling at slow_decel to slow_floor
+acceleration r^2 a_ref, the correction towards the path at full gain, the horizontal command within cap: off the
+path the correction alone would keep the vehicle at the rejoin speed), with cap falling at slow_decel to slow_floor
 and lifted again at recover_accel once the way is clear for 0.5 s; expert frames are labelled with that law. A
 straight stop (then back-off and re-plan) is chosen only when it keeps more clearance than the other two: at speed
 in a forest it leaves the cleared path, which is how pilots 2 and 3 crashed. After --recover_s on the path (within
 0.5 m, heading within 20 degrees, clear of obstacles, governor released) the policy gets control back.
+
+Every clearance a prediction must keep (the trigger's, the soft takeover's, expert_clearance and hard_clearance)
+grows by clearance_per_speed (0.06 m per m/s) of the speed predicted at that point: on PX4 SITL the prediction errs
+more at speed (show_trace.py --prediction on the round-1 replay, predicted minus flown smallest clearance: 95% of
+the errors within 0.04 / 0.14 / 0.22 m below 1, at 1-3 and above 3 m/s), and slowing down needs less of it than
+flying on. The prediction's vehicle (delay_s, response_s) is the one fitted on those traces (show_trace.py
+--response).
 
 Every decision runs the policy as deployed (its chunks are only executed while it has control), so S_t carries the
 setpoint that was actually dispatched: the policy's own under its control (where a_bar and the label disagree)
@@ -91,15 +99,19 @@ class GateConfig:
     clearance: float = 0.5           # predicted privileged clearance that makes the expert brake (m); the planner keeps 0.6
     lookahead_s: float = 0.5         # shortest prediction horizon (s)
     reaction_s: float = 0.3          # the prediction runs the current velocity for reaction_s + the braking time (s)
+    lookahead_m: float = 1.5         # ... and the obstacle trigger at least this far along it (m) ...
+    lookahead_max_s: float = 3.0     # ... within this time (s): when creeping it looks 3 s ahead
     expert_clearance: float = 0.45   # while the expert flies: slow down (or stop) when its predicted closed loop comes closer (m)
     hard_clearance: float = 0.40     # inside expert_clearance already: any predicted approach below this is a conflict (m)
     slow_floor: float = 0.5          # the speed governor slows the expert along its path down to this (m/s)
     slow_decel: float = 2.5          # ... at this rate, which leaves most of accel_max for following the path (m/s^2)
-    clearance_per_speed: float = 0.0  # the conflict threshold grows by this much per m/s of speed (s)
+    clearance_per_speed: float = 0.06  # every clearance a prediction must keep grows by this much per m/s of the speed
+                                       # predicted there (s): its errors grow with speed (show_trace.py --prediction)
     recover_accel: float = 1.0       # ... and lifts its cap again at this rate once the way is clear for 0.5 s (m/s^2)
     rollout_s: float = 2.0           # a soft takeover needs the expert's way back to keep `clearance` for this long (s)
     response_s: float = 0.5          # velocity response time constant of the closed-loop prediction (s; PX4 ~ 1 / MPC_XY_VEL_P_ACC)
-    delay_s: float = 0.2             # dead time of that response: the vehicle keeps its velocity this long (s; pilot 2)
+    delay_s: float = 0.24            # dead time of that response: the vehicle keeps its velocity this long (s; fitted on
+                                     # the round-1 replay, show_trace.py --response: 0.24 s, response 0.50 s, full ff)
     accel_max: float = 7.0           # horizontal acceleration of the prediction's vehicle (m/s^2; below PX4's 45 deg tilt)
     check_period: float = 0.05       # period of the closed-loop prediction while the expert flies (s)
     rejoin_near: float = 0.3         # off the path by more than this, the expert's feed-forward fades out (m)
@@ -203,12 +215,13 @@ class Reference:
                 cap: float = math.inf) -> Command:
         """The expert's setpoint (NED velocity, NED acceleration, yaw rate) with its clock at ``tau``, ``e`` off the
         path and its reference slowed to ``cap`` along the path (on the path, unslowed: ``ExpertController.command``).
-        The correction towards the path keeps its full gain under the governor."""
+        The correction towards the path keeps its full gain under the governor, within the horizontal speed ``cap``."""
         w, vmax = self.blend(e)
         r = self.rate(tau, cap)
         ctrl = self.controller(now, tau)
-        if w >= 1.0 and r >= 1.0:
+        if w >= 1.0 and r >= 1.0 and not math.isfinite(cap):
             return ctrl.command(now, position, yaw)
+        vmax = min(vmax, cap)
         p, v, a, yaw_ref, rate = self.trajectory.reference(float(tau))
         vel = w * r * v + ctrl.k_pos * (p - np.asarray(position, dtype=np.float64))
         yr = r * rate + ctrl.k_yaw * E.wrap_angle(yaw_ref - yaw)
@@ -240,8 +253,9 @@ class Reference:
         ctrl = self.controller(stamp, tau)
         w, vmax = self.blend(self.offset(position) if e is None else e)
         r = self.rate(tau, cap)
-        if w >= 1.0 and r >= 1.0:
+        if w >= 1.0 and r >= 1.0 and not math.isfinite(cap):
             return ctrl.chunk(stamp, position, yaw)
+        vmax = min(vmax, cap)
         s = np.arange(E.HORIZON) * E.KNOT_DT
         p0, _, _, yaw0, _ = self.trajectory.reference(float(tau))
         e_p = p0 - np.asarray(position, dtype=np.float64)
@@ -409,13 +423,24 @@ class DaggerSupervisor:
         g = self.gate
         return max(g.lookahead_s, g.reaction_s + 1.5 * float(speed) / g.brake_decel)
 
+    def trigger_horizon(self, speed: float) -> float:
+        """Horizon of the obstacle trigger at ``speed``: ``horizon``, but reaching at least lookahead_m along the
+        velocity (within lookahead_max_s), so that a policy creeping towards a trunk is taken over with room to spare
+        rather than 0.25 m before it."""
+        g, speed = self.gate, float(speed)
+        reach = min(g.lookahead_m / speed, g.lookahead_max_s) if speed > 1e-6 else 0.0
+        return max(self.horizon(speed), reach)
+
+    def margin(self, speed: float) -> float:
+        """What the clearance a prediction must keep grows by at ``speed`` (the prediction errs more at speed)."""
+        return self.gate.clearance_per_speed * float(speed)
+
     def predicted_clearance(self, position: np.ndarray, velocity: np.ndarray) -> float:
-        """Smallest privileged clearance along the current velocity over the reaction time plus the braking time
-        (sampled every 0.1 m)."""
+        """Smallest privileged clearance along the current velocity over ``trigger_horizon`` (sampled every 0.1 m)."""
         if not len(self.world):
             return math.inf
         speed = float(np.linalg.norm(velocity))
-        horizon = self.horizon(speed)
+        horizon = self.trigger_horizon(speed)
         ts = np.linspace(0.0, horizon, max(6, int(math.ceil(horizon * speed / 0.1)) + 1))
         return float(np.min(self.world.distance(position[None] + ts[:, None] * velocity[None])))
 
@@ -477,6 +502,7 @@ class DaggerSupervisor:
             tau_c = max(tau_s, min(tau_c + r * dt, ref.lead_time(tau_s, g.lead_distance)))
             j = min(int(round(tau_c / ref.dt)), last)
             w, vmax = ref.blend(float(np.linalg.norm(ref.ps[min(int(round(tau_s / ref.dt)), last)] - pos)))
+            vmax = min(vmax, limit)
             r = ref.rate(tau_c, limit)
             cmd = w * r * ref.vs[j] + ref.k_pos * (ref.ps[j] - pos)
             h = math.hypot(cmd[0], cmd[1])
@@ -514,6 +540,14 @@ class DaggerSupervisor:
     def _clearances(self, points: np.ndarray) -> np.ndarray:
         return self.world.distance(points) if len(self.world) else np.full(len(points), np.inf)
 
+    def _margins(self, points: np.ndarray, speed: float, dt: float) -> np.ndarray:
+        """``margin`` at every point of a predicted path (every ``dt``; the first one now, at ``speed``), at the speed
+        predicted there: slowing down or stopping needs less of it than flying on."""
+        out = np.empty(len(points))
+        out[0] = float(speed)
+        out[1:] = np.linalg.norm(np.diff(points, axis=0), axis=1) / dt
+        return self.gate.clearance_per_speed * out
+
     def conflict(self, clearances: np.ndarray, threshold: float) -> bool:
         """Whether a predicted path (clearances, the first one now) comes closer than ``threshold``; from inside it
         already, whether it comes closer than now (2 cm tolerance) or below hard_clearance."""
@@ -525,27 +559,30 @@ class DaggerSupervisor:
 
     def choose(self, position: np.ndarray, velocity: np.ndarray, tau_cmd: float, threshold: float,
                min_horizon: float = 0.0, now: Optional[float] = None) -> str:
-        """The expert's way on from here, by predicted clearance: "fly" (its law, slowed to the governor's cap, keeps
-        ``threshold``), else "slow" (slowing down along its path does), else "stop" (a straight stop does); when none
-        does, the one that keeps the most clearance (within 5 cm: slow before fly before stop, since slower flight
-        leaves more room for what the prediction gets wrong)."""
+        """The expert's way on from here, by predicted clearance less ``margin`` at the predicted speed: "fly" (its law,
+        slowed to the governor's cap, keeps ``threshold``), else "slow" (slowing down along its path does), else "stop"
+        (a straight stop does); when none does, the one that keeps the most (within 5 cm: slow before fly before stop,
+        since slower flight leaves more room for what the prediction gets wrong)."""
         g, ref = self.gate, self.reference
+        speed = float(np.linalg.norm(velocity))
         speed_h = math.hypot(float(velocity[0]), float(velocity[1]))
-        threshold = threshold + g.clearance_per_speed * float(np.linalg.norm(velocity))
-        horizon = max(min_horizon, self.horizon(max(float(np.linalg.norm(velocity)), min(self.cap, ref.speed))))
+        horizon = max(min_horizon, self.horizon(max(speed, min(self.cap, ref.speed))))
         predicted: Dict[str, float] = {}
-        fly = self._clearances(self.rollout(position, velocity, tau_cmd, horizon, cap=self.cap, now=now))
-        predicted["fly"] = float(np.min(fly[1:]))
+
+        def kept(points: np.ndarray, name: str) -> np.ndarray:
+            clearances = self._clearances(points)
+            predicted[name] = float(np.min(clearances[1:]))
+            return clearances - self._margins(points, speed, 0.05)
+
+        fly = kept(self.rollout(position, velocity, tau_cmd, horizon, cap=self.cap, now=now), "fly")
         if not self.conflict(fly, threshold):
             return self._chose("fly", predicted, threshold, now)
         start = max(g.slow_floor, min(self.cap, speed_h))
-        slow = self._clearances(self.rollout(position, velocity, tau_cmd, horizon, cap=start,
-                                             slow=g.slow_decel, floor=g.slow_floor, now=now))
-        predicted["slow"] = float(np.min(slow[1:]))
+        slow = kept(self.rollout(position, velocity, tau_cmd, horizon, cap=start, slow=g.slow_decel,
+                                 floor=g.slow_floor, now=now), "slow")
         if not self.conflict(slow, threshold):
             return self._chose("slow", predicted, threshold, now)
-        stop = self._clearances(self.brake_rollout(position, velocity, horizon, now=now))
-        predicted["stop"] = float(np.min(stop[1:]))
+        stop = kept(self.brake_rollout(position, velocity, horizon, now=now), "stop")
         if not self.conflict(stop, threshold):
             return self._chose("stop", predicted, threshold, now)
         ways = (("slow", slow), ("fly", fly), ("stop", stop))
@@ -554,8 +591,8 @@ class DaggerSupervisor:
         return self._chose(way, predicted, threshold, now)
 
     def _chose(self, way: str, predicted: Dict[str, float], threshold: float, now: Optional[float]) -> str:
-        """Keep the way ``choose`` took, the clearance it needed, the current one and the smallest predicted clearance
-        of every way it evaluated (for traces: what the prediction expected against what was flown)."""
+        """Keep the way ``choose`` took, the clearance it needed (before the speed margin) and the smallest predicted
+        clearance of every way it evaluated (for traces: what the prediction expected against what was flown)."""
         self.last_choice = {"t": None if now is None else float(now), "way": way, "threshold": round(float(threshold), 3),
                             **{k: (round(v, 3) if math.isfinite(v) else None) for k, v in predicted.items()}}
         return way
@@ -600,7 +637,7 @@ class DaggerSupervisor:
     def trigger(self, now: float, position: np.ndarray, velocity: np.ndarray, yaw: float) -> Optional[str]:
         """Why the expert must take over now (``TRIGGERS``), or None."""
         g, ref = self.gate, self.reference
-        if self.predicted_clearance(position, velocity) < g.clearance:
+        if self.predicted_clearance(position, velocity) < g.clearance + self.margin(float(np.linalg.norm(velocity))):
             return "obstacle"
         if -position[2] < g.altitude:
             return "low"
@@ -1021,7 +1058,7 @@ def _self_test() -> None:
     assert sup.backoffs == 1 and float(trunk.distance(sup.plan_start)) >= 0.8 - 1e-6 and sup.replans == 1
 
     # ---- the expert itself heading for a trunk 1.2 m away (momentum, tracking error): a straight stop needs
-    # 1.0 m (0.2 s dead time at 2 m/s + the minimum-jerk stop) and would end 0.2 m from it; slowing the reference
+    # 1.1 m (0.24 s dead time at 2 m/s + the minimum-jerk stop) and would end 0.1 m from it; slowing the reference
     # down along its path (full correction kept) steers round it, so the governor does that instead
     sup = DaggerSupervisor(trunk, tplanner, goal, 3.0, tplanner.plan(start, goal, 3.0, 0.0), 0.0,
                            lambda s, w, v: plan_now(tplanner, s, w, v), None, {}, GateConfig())
@@ -1032,8 +1069,8 @@ def _self_test() -> None:
     vehicle.v = np.array([2.0, 0.0, 0.0])
     sup.reference.tau = sup.reference.nearest(vehicle.p, back=0.0, ahead=10.0)
     assert sup.choose(vehicle.p, vehicle.v, sup.reference.tau, sup.gate.expert_clearance) == "slow"
-    choice = sup.last_choice
-    assert choice["way"] == "slow" and choice["slow"] >= max(choice["fly"], choice["stop"]), choice   # most room
+    choice = sup.last_choice                     # every way comes too close; slowing down along the path keeps the
+    assert choice["way"] == "slow" and choice["stop"] < choice["slow"], choice       # most room beyond the speed margin
     assert sup.control(0.01, vehicle.p, vehicle.v, vehicle.yaw) is not None
     assert sup.mode == "EXPERT" and sup.slowing and sup.slowdowns == 1 and sup.cap <= 2.0 + 1e-9
     closest, t = math.inf, 0.01
@@ -1053,15 +1090,18 @@ def _self_test() -> None:
     lab = ref.label(0.0, tau_fast, p_fast, ref.yaw(tau_fast), cap=1.0)
     assert abs(float(np.linalg.norm(lab[0, :2])) - 1.0) < 0.02, lab[0]
 
-    # ---- the closed-loop prediction follows the expert's own path (no false alarm on it)
+    # ---- the closed-loop prediction follows the expert's own path (no false alarm on it), the setpoints in flight
+    # being the expert's along it; through the 90-degree turn at 3 m/s the 0.24 s dead time widens it by 0.13 m
     sup = DaggerSupervisor(world, planner, waypoints, 3.0, E.ExpertTrajectory(trajectory.spline, 0.0), 0.0, plan,
                            None, {}, GateConfig())
     for t0 in (1.0, 4.0, 7.5):
         sup.reference.tau, sup.tau_cmd = t0, t0
+        for t_s in np.arange(t0 - 0.4, t0 + 1e-9, 0.01):
+            sup.dispatched(float(t_s), trajectory.reference(t_s)[1], trajectory.reference(t_s)[2])
         p0, v0 = trajectory.reference(t0)[0], trajectory.reference(t0)[1]
-        pts = sup.rollout(p0, v0, t0, 2.0)
+        pts = sup.rollout(p0, v0, t0, 2.0, now=t0)
         dev = [float(np.min(np.linalg.norm(sup.reference.ps - q, axis=1))) for q in pts]
-        assert max(dev) < 0.1, (t0, max(dev))
+        assert max(dev) < 0.15, (t0, max(dev))
 
     # ---- soft takeover whose way back crosses a trunk: re-plan instead; the expert never gets close to it
     side = E.PrivilegedMap([E.Obstacle("cylinder", (4.3, 1.0, -3.0), radius=0.3, half_height=3.0)])
