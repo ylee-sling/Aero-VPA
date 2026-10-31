@@ -43,6 +43,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--brief", action="store_true", help="summary only, no timeline")
     p.add_argument("--every", type=float, default=1.0, help="timeline step (s)")
     p.add_argument("--last", type=float, default=2.0, help="print every decision of the last seconds")
+    p.add_argument("--window", type=float, default=None, help="timeline of the last seconds only (default: all)")
     p.add_argument("--svg", default=None, help="draw the mission (one trace)")
     p.add_argument("--world_json", default=None, help="world sidecar for the trunks (default: from the record)")
     p.add_argument("--self-test", dest="self_test", action="store_true")
@@ -177,16 +178,26 @@ def _row_line(r: Dict[str, Any]) -> str:
             f"{MODES.get(int(r.get('mode', -1)), '?'):6s} {r['sigma_bar']:.3f}"
             + (f"  {r['dagger_mode'][:6]:6s} {_f(r.get('e_path'), 2):>5s} "
                f"{_f(None if r.get('label0') is None else float(np.linalg.norm(r['label0'][:3])), 2):>5s} "
-               f"{_f(r.get('dagger_cap'), 1):>4s}"
+               f"{_f(r.get('dagger_cap'), 1):>4s} {_choice(r)}"
                if "dagger_mode" in r else ""))
 
 
 HEADER = ("     t       x       y   alt   spd    yaw  m  wpdst   brg  u_sel/u   view     az   el     d vsafe     s "
           " |raw|  rbrg  yawr  |cmd|   clr mode   sigma_bar")
-DAGGER_HEADER = "  dagger  epath |lab|  cap"
+DAGGER_HEADER = "  dagger  epath |lab|  cap  way  pred  gap"
 
 
-def report(path: str, record: Dict[str, Any], rows: List[Dict[str, Any]], brief: bool, every: float, last: float) -> Dict[str, Any]:
+def _choice(r: Dict[str, Any]) -> str:
+    """The expert's last way (fly / slow / stop), its predicted smallest clearance and the longest setpoint gap
+    since the previous decision (ms), when the trace has them (fly_policy.py since 2026-10-31)."""
+    c = r.get("dagger_choice") or {}
+    way = c.get("way")
+    return (f"{(way or '-')[:4]:>4s} {_f(c.get(way) if way else None, 2):>5s} "
+            f"{_f(r.get('tick_gap_ms'), 0):>4s}")
+
+
+def report(path: str, record: Dict[str, Any], rows: List[Dict[str, Any]], brief: bool, every: float, last: float,
+           window: Optional[float] = None) -> Dict[str, Any]:
     a = analyse(record, rows)
     n = max(1, a["decisions"])
     print(f"== {os.path.basename(path)}")
@@ -229,11 +240,21 @@ def report(path: str, record: Dict[str, Any], rows: List[Dict[str, Any]], brief:
         return a
     print("   timeline (* blind; F fallback; brg: waypoint bearing; rbrg / yawr: raw first knot bearing and yaw rate; "
           "|cmd|: after s_t and the rate limit" + ("; dagger: who flies, epath: distance to the expert path, |lab|: "
-                                                  "speed of the expert's label, cap: the expert's speed governor"
+                                                  "speed of the expert's label, cap: the expert's speed governor, way "
+                                                  "/ pred: its last choice and that way's predicted smallest "
+                                                  "clearance, gap: longest setpoint gap (ms)"
                                                   if a["dagger_modes"] else "") + ")")
+    events = []
+    for r in rows:
+        ev = r.get("dagger_event")
+        if ev and (not events or events[-1] != ev):
+            events.append(ev)
+    if events:
+        print("   expert takeovers and stops (t, reason, way): "
+              + "; ".join(f"{e[0]:.1f} {e[1]} {e[2]}" for e in events[-8:]))
     print("   " + HEADER + (DAGGER_HEADER if a["dagger_modes"] else ""))
-    t_next = -math.inf
     t_end = rows[-1]["t"]
+    t_next = -math.inf if window is None else t_end - window
     for r in rows:
         if r["t"] >= t_end - last:
             break
@@ -347,7 +368,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     for path in args.traces:
         record, rows = load_trace(path)
-        report(path, record, rows, args.brief, args.every, args.last)
+        report(path, record, rows, args.brief, args.every, args.last, args.window)
         print()
         if args.svg:
             svg(record, rows, args.world_json, args.svg)
@@ -373,6 +394,10 @@ def _self_test() -> None:
                      "raw_peak": 2.0, "cmd0": [0.0, 1.0, 0.0, -0.3] if side else [2.0, 0.0, 0.0, 0.0], "v_safe": 1.0,
                      "scale": 0.5 if side else 1.0, "d": 19.1, "blind": side, "view": "behind" if side else "clear",
                      "az": 90.0 if side else 0.0, "el": 0.0})
+    rows[-1].update(dagger_mode="EXPERT", e_path=0.4, label0=[1.0, 0.0, 0.0, 0.0], dagger_cap=1.5, tick_gap_ms=12.0,
+                    dagger_choice={"way": "slow", "threshold": 0.45, "fly": 0.3, "slow": 0.52},
+                    dagger_event=[2.8, "obstacle", "slow"])
+    assert _choice(rows[-1]).split() == ["slow", "0.52", "12"] and _choice(rows[0]).split() == ["-", "-", "-"]
     a = analyse(rec, rows)
     assert a["decisions"] == 30 and a["views"]["behind"] == 15 and a["capped"] == 15
     assert a["selected"]["LAT"] == 15 and a["modes"]["TRACK"] == 30
@@ -389,6 +414,7 @@ def _self_test() -> None:
         text = open(out_svg, encoding="utf-8").read()
         assert text.startswith("<svg") and text.rstrip().endswith("</svg>") and "polyline" in text
         assert main([path, "--brief"]) == 0
+        assert main([path, "--every", "0.1", "--last", "0", "--window", "0.5"]) == 0
     print("show_trace.py self-test passed")
 
 

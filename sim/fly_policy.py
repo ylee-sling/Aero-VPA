@@ -73,7 +73,7 @@ import expert as E  # noqa: E402
 from checkpoint import config_from_dict, load_checkpoint  # noqa: E402
 from clearance import REASONS, DepthRange  # noqa: E402
 from collect_expert_dataset import OdometryBuffer, WriterProcess, _ignore_sigint, _read_environment, decode_image  # noqa: E402
-from dagger import DaggerSupervisor, GateConfig, InlineWriter, plan_now  # noqa: E402
+from dagger import TRIGGERS, DaggerSupervisor, GateConfig, InlineWriter, plan_now  # noqa: E402
 from dagger import file_attributes as dagger_file_attributes  # noqa: E402
 from pipeline import MODE_TRACK, VPAInferencePipeline  # noqa: E402
 
@@ -220,6 +220,8 @@ class Mission:
         self.last_frame = self.t0
         self.end_time = self.t0
         self.last_mode, self.last_setpoint = -1, np.zeros(4)
+        self.last_acc = np.zeros(3)                         # acceleration feed-forward of the last setpoint (traces)
+        self.gap_since_row = 0.0                            # longest gap between setpoints since the last trace row
         self.trace: Optional[List[Dict[str, Any]]] = [] if getattr(args, "trace", None) else None
 
     @torch.no_grad()
@@ -280,7 +282,15 @@ class Mission:
                     row.update(controller=labelled["controller"], tau=_rounded(labelled["tau"]),
                                e_path=_rounded(labelled["e_path"]), label0=_rounded(labelled["label0"]),
                                label_primitive=labelled["primitive"])
+                choice, event = self.dagger.last_choice, self.dagger.last_event
+                if choice is not None:                                       # the expert's last prediction
+                    row["dagger_choice"] = {k: v for k, v in choice.items() if k != "t"}
+                    if choice["t"] is not None:
+                        row["dagger_choice_t"] = _rounded(choice["t"] - self.t0, 2)
+                if event is not None:                                        # its last takeover or stop
+                    row["dagger_event"] = [_rounded(event[0] - self.t0, 2), event[1], event[2]]
             self.trace.append(row)
+        self.gap_since_row = 0.0
 
     def _trace_row(self, stamp: float, position: np.ndarray, velocity: np.ndarray, yaw: float, q: np.ndarray,
                    rates: np.ndarray, state: torch.Tensor, out: Any, reading: Any) -> Dict[str, Any]:
@@ -299,7 +309,8 @@ class Mission:
             "sigma": r(out.sigma[0], 4), "sigma_bar": r(out.sigma_bar[0], 4), "alpha": r(out.alpha[0]),
             "H": int(out.validity_horizon[0]), "state": r(state[0]),
             "clearance": r(self.world.distance(np.asarray(position, dtype=np.float64))) if len(self.world) else None,
-            "mode": self.last_mode, "setpoint": r(self.last_setpoint),
+            "mode": self.last_mode, "setpoint": r(self.last_setpoint), "setpoint_acc": r(self.last_acc),
+            "tick_gap_ms": r(1e3 * self.gap_since_row, 1),
         }
         if out.chunk_raw is not None and bool(out.committed[0]):
             raw = out.chunk_raw[0].cpu().numpy()
@@ -328,13 +339,14 @@ class Mission:
         if self.prev_tick is not None:
             dt = float(now) - self.prev_tick
             self.max_setpoint_gap = max(self.max_setpoint_gap, dt)
+            self.gap_since_row = max(self.gap_since_row, dt)
             self.has_chunk = self.has_chunk or bool(torch.isfinite(out.chunk_age[0]))
             if self.has_chunk and int(out.mode[0]) != MODE_TRACK:
                 self.not_tracking_s += dt
         self.prev_tick = float(now)
         vel, acc = out.velocity[0].cpu().numpy().astype(np.float64), out.acceleration[0].cpu().numpy().astype(np.float64)
         yaw_rate = float(out.yaw_rate[0])
-        self.last_mode, self.last_setpoint = int(out.mode[0]), np.array([*vel, yaw_rate])
+        self.last_mode, self.last_setpoint, self.last_acc = int(out.mode[0]), np.array([*vel, yaw_rate]), acc
         return vel, acc, yaw_rate
 
     def command(self, now: float, position: np.ndarray, velocity: np.ndarray, yaw: float
@@ -353,8 +365,9 @@ class Mission:
                                                    torch.tensor([yaw_rate], dtype=torch.float32))
                 if self.prev_tick is not None:
                     self.max_setpoint_gap = max(self.max_setpoint_gap, float(now) - self.prev_tick)
+                    self.gap_since_row = max(self.gap_since_row, float(now) - self.prev_tick)
                 self.prev_tick = float(now)
-                self.last_mode, self.last_setpoint = -2, np.array([*vel, yaw_rate])          # -2: the expert
+                self.last_mode, self.last_setpoint, self.last_acc = -2, np.array([*vel, yaw_rate]), acc   # -2: expert
                 return vel, acc, yaw_rate
         vel, acc, yaw_rate = self.tick(now)
         if self.dagger is not None:
@@ -1172,7 +1185,12 @@ def _self_test() -> None:
             eps = [f[k] for k in sorted(f) if k.startswith("episode_")]
             assert all(int(ep.attrs["mission"]) == 0 and float(ep.attrs["speed_limit"]) == 3.0 for ep in eps)
         rows = [json.loads(line) for line in open(rec["trace"], encoding="utf-8")][1:]
-        assert {"dagger_mode"} <= set(rows[0]) and any(r.get("controller") == "expert" for r in rows)
+        assert {"dagger_mode", "setpoint_acc", "tick_gap_ms"} <= set(rows[0])
+        assert any(r.get("controller") == "expert" for r in rows)
+        assert all(0.0 <= r["tick_gap_ms"] < 50.0 for r in rows[1:])            # dry run: a setpoint every 10 ms
+        choices = [r["dagger_choice"] for r in rows if "dagger_choice" in r]   # the expert's predictions
+        assert choices and all(c["way"] in ("fly", "slow", "stop") and "fly" in c for c in choices)
+        assert any(r.get("dagger_event", [None, None])[1] in TRIGGERS for r in rows)          # a takeover and its way
         labelled = [r for r in rows if "controller" in r]
         assert len(labelled) >= frames and all(len(r["label0"]) == 4 for r in labelled)
         # a second run appends to the same file

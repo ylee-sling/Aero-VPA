@@ -357,6 +357,8 @@ class DaggerSupervisor:
         self.cap, self.slowing = math.inf, False             # the expert's speed governor (horizontal speed cap)
         self.clear_since: Optional[float] = None
         self.slowdowns = 0
+        self.last_choice: Optional[Dict[str, Any]] = None    # the last `choose`: way and predicted clearances (traces)
+        self.last_event: Optional[Tuple[float, str, str]] = None   # (time, reason, way) of the last takeover / stop
         self.sent: deque = deque(maxlen=64)                  # (time, velocity, acceleration) setpoints dispatched
         self.hold: Optional[E.ExpertController] = None
         self.backoff_z = 0.0
@@ -531,20 +533,32 @@ class DaggerSupervisor:
         speed_h = math.hypot(float(velocity[0]), float(velocity[1]))
         threshold = threshold + g.clearance_per_speed * float(np.linalg.norm(velocity))
         horizon = max(min_horizon, self.horizon(max(float(np.linalg.norm(velocity)), min(self.cap, ref.speed))))
+        predicted: Dict[str, float] = {}
         fly = self._clearances(self.rollout(position, velocity, tau_cmd, horizon, cap=self.cap, now=now))
+        predicted["fly"] = float(np.min(fly[1:]))
         if not self.conflict(fly, threshold):
-            return "fly"
+            return self._chose("fly", predicted, threshold, now)
         start = max(g.slow_floor, min(self.cap, speed_h))
         slow = self._clearances(self.rollout(position, velocity, tau_cmd, horizon, cap=start,
                                              slow=g.slow_decel, floor=g.slow_floor, now=now))
+        predicted["slow"] = float(np.min(slow[1:]))
         if not self.conflict(slow, threshold):
-            return "slow"
+            return self._chose("slow", predicted, threshold, now)
         stop = self._clearances(self.brake_rollout(position, velocity, horizon, now=now))
+        predicted["stop"] = float(np.min(stop[1:]))
         if not self.conflict(stop, threshold):
-            return "stop"
+            return self._chose("stop", predicted, threshold, now)
         ways = (("slow", slow), ("fly", fly), ("stop", stop))
         best = max(float(np.min(c[1:])) for _, c in ways)
-        return next(name for name, c in ways if float(np.min(c[1:])) >= best - 0.05)
+        way = next(name for name, c in ways if float(np.min(c[1:])) >= best - 0.05)
+        return self._chose(way, predicted, threshold, now)
+
+    def _chose(self, way: str, predicted: Dict[str, float], threshold: float, now: Optional[float]) -> str:
+        """Keep the way ``choose`` took, the clearance it needed, the current one and the smallest predicted clearance
+        of every way it evaluated (for traces: what the prediction expected against what was flown)."""
+        self.last_choice = {"t": None if now is None else float(now), "way": way, "threshold": round(float(threshold), 3),
+                            **{k: (round(v, 3) if math.isfinite(v) else None) for k, v in predicted.items()}}
+        return way
 
     def _slow_down(self, velocity: np.ndarray) -> None:
         """Start (or continue) slowing the expert down along its path from its current horizontal speed."""
@@ -638,6 +652,7 @@ class DaggerSupervisor:
                 way = self.choose(p, v, ref.tau, g.clearance, g.rollout_s, now)
                 if way == "stop":
                     self.soft_blocked += 1                   # even slowed down, the way back would pass an obstacle
+            self.last_event = (now, reason, way)
             if way == "stop":
                 self._start_brake(now, v, reason)
             else:
@@ -669,6 +684,7 @@ class DaggerSupervisor:
                                 self.cap, self.clear_since = math.inf, None
             if way == "stop":
                 self.expert_brakes += 1
+                self.last_event = (now, "expert", "stop")
                 self._start_brake(now, v, "obstacle while the expert flies")
             elif (now - self.mode_since >= g.recover_s and not math.isfinite(self.cap) and ref.tau >= ref.launch
                   and self._on_track(p, yaw)):
@@ -986,6 +1002,8 @@ def _self_test() -> None:
     order = [m for i, m in enumerate(seen) if i == 0 or seen[i - 1] != m]
     assert sup.takeovers["obstacle"] == 1 and order == ["POLICY", "EXPERT"] and sup.replans == 0, order
     assert closest > 0.5, closest
+    assert sup.last_event is not None and sup.last_event[1:] in (("obstacle", "fly"), ("obstacle", "slow"))
+    assert sup.last_choice is not None and sup.last_choice["fly"] is not None   # traces: what the prediction expected
     # stopped close to the trunk: back away before planning (the planner needs 0.6 m at the start)
     sup = DaggerSupervisor(trunk, tplanner, goal, 3.0, tplanner.plan(start, goal, 3.0, 0.0), 0.0,
                            lambda s, w, v: plan_now(tplanner, s, w, v), None, {}, GateConfig())
@@ -1014,6 +1032,8 @@ def _self_test() -> None:
     vehicle.v = np.array([2.0, 0.0, 0.0])
     sup.reference.tau = sup.reference.nearest(vehicle.p, back=0.0, ahead=10.0)
     assert sup.choose(vehicle.p, vehicle.v, sup.reference.tau, sup.gate.expert_clearance) == "slow"
+    choice = sup.last_choice
+    assert choice["way"] == "slow" and choice["slow"] >= max(choice["fly"], choice["stop"]), choice   # most room
     assert sup.control(0.01, vehicle.p, vehicle.v, vehicle.yaw) is not None
     assert sup.mode == "EXPERT" and sup.slowing and sup.slowdowns == 1 and sup.cap <= 2.0 + 1e-9
     closest, t = math.inf, 0.01
