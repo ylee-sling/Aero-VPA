@@ -36,6 +36,7 @@ Options:
   --data GLOB         demonstrations                                                       ['data/*.hdf5']
   --val GLOB          validation flights for the calibration                               ['data_val/*.hdf5']
   --skip_flights      only cache, train and calibrate (the flights of this round are done)
+  --no_train          only fly and cache (another recipe trains on the rounds' data afterwards)
   -h, --help
 Arguments after "--" are passed to fly_policy.py (e.g. -- --gate_distance 2.0); the flights use a mission timeout
 of 3 x the expert's duration + 30 s, since takeovers that re-plan cost several seconds each, and end a mission only
@@ -45,7 +46,7 @@ EOF
 }
 
 ROUND=""; POLICY=""; STAGE1=""; LIKE=""; LATENTS=""; WORLDS='sim/worlds/*.sdf'; MISSIONS=1; INSTANCES=3; WEIGHT=3
-DATA='data/*.hdf5'; VAL='data_val/*.hdf5'; SKIP_FLIGHTS=0; EXTRA=()
+DATA='data/*.hdf5'; VAL='data_val/*.hdf5'; SKIP_FLIGHTS=0; NO_TRAIN=0; EXTRA=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --round) ROUND="$2"; shift 2 ;;
@@ -60,6 +61,7 @@ while [[ $# -gt 0 ]]; do
         --data) DATA="$2"; shift 2 ;;
         --val) VAL="$2"; shift 2 ;;
         --skip_flights) SKIP_FLIGHTS=1; shift ;;
+        --no_train) NO_TRAIN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         --) shift; EXTRA=("$@"); break ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -128,6 +130,11 @@ fi
 log "caching latents of $DATA and $OUT in $LATENTS"
 "$PYTHON" cache_latents.py "$STAGE1" "$DATA" "$OUT/*.hdf5" --out_dir "$LATENTS" > "$LOGS/cache.log" 2>&1 \
     || { log "cache_latents failed"; exit 1; }
+if [[ $NO_TRAIN -eq 1 ]]; then
+    "$PYTHON" sim/summarize_flights.py "${OUT}"_i*.jsonl > "$LOGS/flights_summary.txt" 2>&1 || true
+    log "done: flights and latents of round $ROUND (--no_train; flights: $LOGS/flights_summary.txt)"
+    exit 0
+fi
 
 # ---- 3. stage (ii) on the demonstrations and every round so far, trained like --like
 TRAIN_ARGS=$("$PYTHON" - "$LIKE" <<'PY'
