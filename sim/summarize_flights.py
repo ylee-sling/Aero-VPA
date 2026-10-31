@@ -110,6 +110,9 @@ def stats(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         "blind": sum(r["blind_decisions"] for r in records) / max(1, sum(r["decisions"] for r in records)),
         "latency_p95_ms": _median([r["decision_latency_ms"]["p95"] for r in records]),
         "age_p95_ms": _median([r["decision_age_ms"]["p95"] for r in records]),
+        "setpoint_gap": _median([r.get("max_setpoint_gap_s") for r in records]),
+        "setpoint_gap_max": max((r["max_setpoint_gap_s"] for r in records if r.get("max_setpoint_gap_s") is not None),
+                                default=math.nan),
         **_dagger_stats([r for r in records if r.get("dagger")]),
     }
 
@@ -194,6 +197,8 @@ def report(data: Dict[str, Dict[Tuple[str, int], Dict[str, Any]]], by: Optional[
         ("blind decisions", lambda s: f"{100 * s['blind']:.1f}%"),
         ("decision compute p95 (ms)", lambda s: f"{s['latency_p95_ms']:.1f}"),
         ("decision age p95 (ms)", lambda s: f"{s['age_p95_ms']:.1f}"),
+        ("longest setpoint gap (s, med/max)", lambda s: "-" if not math.isfinite(s["setpoint_gap_max"])
+         else f"{s['setpoint_gap']:.2f} / {s['setpoint_gap_max']:.2f}"),
     ]
     if any("dagger_missions" in table[t] for t in tags):
         def takeovers(st: Dict[str, Any]) -> str:
@@ -269,9 +274,14 @@ def _self_test() -> None:
                 f.write(json.dumps(rec("A", "aero_forest_dense_s1000", k, True, "success")) + "\n")
                 f.write(json.dumps(rec("B", "aero_forest_dense_s1000", k, k < 2, "success" if k < 2 else "collision")) + "\n")
             f.write(json.dumps(rec("B", "aero_forest_dense_s1000", 5, True, "success")) + "\n")   # re-flown: last wins
-        out = report(load([path]), by="density")
+        with open(path, "a", encoding="utf-8") as f:                      # control-loop stalls (fly_policy.py)
+            f.write(json.dumps({**rec("C", "aero_forest_dense_s1000", 0, True, "success"), "max_setpoint_gap_s": 0.02}) + "\n")
+            f.write(json.dumps({**rec("C", "aero_forest_dense_s1000", 1, False, "collision"), "max_setpoint_gap_s": 0.74}) + "\n")
+        out = report(load([path]), by="density", compare=("A", "B"))
+        assert math.isclose(out["stats"]["C"]["setpoint_gap"], 0.38) and out["stats"]["C"]["setpoint_gap_max"] == 0.74
+        assert not math.isfinite(out["stats"]["A"]["setpoint_gap_max"])                    # older records: no field
         lines = mission_lines(load([path]))
-        assert len(lines) == 1 + 12 and "dense_s1000" in lines[1] and "CRU" not in lines[1]
+        assert len(lines) == 1 + 14 and "dense_s1000" in lines[1] and "CRU" not in lines[1]
         assert out["stats"]["A"]["missions"] == 6 and out["stats"]["A"]["success"] == 1.0
         assert out["stats"]["B"]["missions"] == 6 and math.isclose(out["stats"]["B"]["success"], 0.5)
         assert out["paired"] == {"missions": 6, "both": 3, "only_a": 3, "only_b": 0, "neither": 0,

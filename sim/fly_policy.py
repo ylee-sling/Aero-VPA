@@ -43,6 +43,10 @@ the executor mode and the privileged clearance. sim/show_trace.py summarises a t
 --dry_run flies the same protocol without ROS: the kinematic model and the ray-cast camera of sim/expert.py in a
 synthetic forest (or --world_json). Its images are not Gazebo's, so it checks the plumbing, not the policy.
 
+Before the first mission the policy decides --warmup times on a synthetic frame (``warm_up``): the first decision
+of a process pays for lazy GPU initialisation, and a decision blocks the single-threaded ROS executor, so without
+it the first mission of a run can start with no setpoint going out for as long as that decision takes.
+
 Exit status: 0 all missions flown, 1 errors, 3 after a collision (restart the simulator, continue), 130 interrupted.
 """
 
@@ -104,6 +108,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--collision_distance", type=float, default=0.35, help="privileged distance of a collision (m)")
     p.add_argument("--trace", default=None, metavar="DIR", help="write a per-decision trace of every mission to DIR")
     p.add_argument("--device", default="auto")
+    p.add_argument("--warmup", type=int, default=3,
+                   help="decisions on a synthetic frame before the first mission, so that its first decision does not "
+                        "freeze the control loop with lazy GPU initialisation (0: off)")
     p.add_argument("--dry_run", action="store_true", help="kinematic model and ray-cast camera, no ROS (plumbing only)")
     dag = p.add_argument_group("DAgger (stage iii, sim/dagger.py)")
     dag.add_argument("--dagger_dir", default=None, metavar="DIR",
@@ -135,6 +142,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         p.error("give the policy checkpoint (or --self-test)")
     if args.episodes < 1:
         p.error("--episodes must be >= 1")
+    if args.warmup < 0:
+        p.error("--warmup must be >= 0")
     if args.dagger_dir and (not args.speed_limits or min(args.speed_limits) <= 0.0):
         p.error("--speed_limits must be positive")
     args.tag = args.tag or os.path.basename(args.checkpoint)
@@ -206,7 +215,7 @@ class Mission:
         self.min_clearance = math.inf
         self.not_tracking_s, self.has_chunk = 0.0, False
         self.prev_pos: Optional[np.ndarray] = None
-        self.prev_tick: Optional[float] = None
+        self.prev_tick: Optional[float] = self.t0           # the wait for the first setpoint is a gap too
         self.max_setpoint_gap = 0.0
         self.last_frame = self.t0
         self.end_time = self.t0
@@ -426,6 +435,45 @@ def append_record(path: str, record: Dict[str, Any]) -> None:
         os.fsync(f.fileno())
 
 
+def warm_up(policy: Policy, args: argparse.Namespace, decisions: int) -> List[float]:
+    """Decide ``decisions`` times (with executor ticks) in a throwaway mission on a synthetic frame; returns the
+    wall time of each decision (ms).
+
+    The first decision of a process pays for lazy GPU initialisation (library handles, kernel loading), and a
+    decision blocks the single-threaded ROS executor, so meanwhile no setpoint goes out and PX4 keeps executing
+    the last one. Pilot 4's only crash began like that: in the first mission of its run the vehicle stayed put for
+    0.76 s while turning 39 deg at the alignment's yaw rate, then caught up at 5.5 m/s and left its path. Missions
+    are unchanged: the next ``Mission`` resets the pipeline, and the random-number states are restored here.
+    """
+    if decisions <= 0:
+        return []
+    cpu_rng = torch.random.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    quiet = argparse.Namespace(**{**vars(args), "trace": None})
+    home = np.array([0.0, 0.0, -float(args.takeoff_altitude)])
+    times: List[float] = []
+    try:
+        mission = Mission(policy, E.PrivilegedMap(), home[None] + np.array([[10.0, 0.0, 0.0]]), 0.0, 10.0, quiet)
+        rgb = np.full((*E.IMAGE_SIZE, 3), 96, dtype=np.uint8)
+        depth = np.tile(np.linspace(2.0, 8.0, E.IMAGE_SIZE[1], dtype=np.float32), (E.IMAGE_SIZE[0], 1))
+        level = np.array([1.0, 0.0, 0.0, 0.0])                                 # (w, x, y, z): level, facing north
+        for i in range(decisions):
+            stamp = 0.03 * i
+            started = time.perf_counter()
+            mission.decide(stamp, rgb, depth, home, np.zeros(3), level, np.zeros(3))
+            for k in range(3):
+                mission.tick(stamp + 0.01 * k)
+            if policy.device.type == "cuda":
+                torch.cuda.synchronize(policy.device)
+            times.append(1e3 * (time.perf_counter() - started))
+        policy.pipe.external_setpoint(torch.zeros(1, 3), torch.zeros(1))      # the DAgger takeover path
+    finally:
+        torch.random.set_rng_state(cpu_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state_all(cuda_rng)
+    return times
+
+
 def mission_for(world: E.PrivilegedMap, args: argparse.Namespace, k: int, home: np.ndarray, attempt: int = 0) -> np.ndarray:
     """The waypoints of mission ``k``: identical for every policy and every restart. ``attempt`` > 0 draws a
     replacement, in the same order for everyone, when the expert cannot plan the mission."""
@@ -507,6 +555,7 @@ def _record_extra(args: argparse.Namespace, policy: Policy, k: int, mode: str, h
 def run_dry(args: argparse.Namespace, physics_rate: float = 250.0, camera_rate: float = 50.0) -> int:
     world = E.load_world(args.world_json) if args.world_json else E.synthetic_forest(seed=args.seed)
     policy = Policy(args)
+    policy.meta["warmup_ms"] = [round(x, 1) for x in warm_up(policy, args, args.warmup)]
     planner, camera = E.ExpertPlanner(world), E.PinholeCamera()
     home = np.array([0.0, 0.0, -args.takeoff_altitude])
     render_rng = np.random.default_rng(args.seed)
@@ -583,6 +632,14 @@ def run_ros(args: argparse.Namespace) -> int:
             if args.world_json is None:
                 self.get_logger().warning("no --world_json / $AERO_VPA_WORLD_JSON: no collision check, no expert map")
             self.policy = Policy(args)
+            try:                                       # before spinning: nothing waits on the executor yet
+                times = warm_up(self.policy, args, args.warmup)
+                self.policy.meta["warmup_ms"] = [round(x, 1) for x in times]
+                if times:
+                    self.get_logger().info("policy warm-up: decisions took " + ", ".join(f"{x:.0f}" for x in times)
+                                           + " ms")
+            except Exception as exc:                   # never block a flight: the first decision is just slow then
+                self.get_logger().warning(f"policy warm-up failed ({type(exc).__name__}: {exc})")
             self.planner = E.ExpertPlanner(self.world)
             self.pool = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"), initializer=_ignore_sigint)
             self.writer: Optional[WriterProcess] = None
@@ -1068,6 +1125,27 @@ def _self_test() -> None:
         assert not np.allclose(mission_for(world, args, 0, home, attempt=1), records[0]["waypoints_ned"])
         out = report(load([results]))
         assert out["stats"]["policy.pt"]["missions"] == 2 and out["stats"]["again"]["missions"] == 1
+        assert records[0]["warmup_ms"] and len(records[0]["warmup_ms"]) == args.warmup == 3     # on by default
+
+        # the warm-up runs decisions of a throwaway mission and changes nothing in the real ones
+        flown = []
+        for warm in ("0", "2"):
+            path = os.path.join(tmp, f"warm{warm}.jsonl")
+            torch.manual_seed(11)
+            assert run_dry(parse_args(base + ["--episodes", "1", "--episode_start", "5", "--warmup", warm,
+                                              "--results", path])) == 0
+            flown.append(json.loads(open(path, encoding="utf-8").readline()))
+        cold, warm_rec = flown
+        assert cold["warmup_ms"] == [] and len(warm_rec["warmup_ms"]) == 2 and min(warm_rec["warmup_ms"]) > 0.0
+        assert 0.0 <= cold["max_setpoint_gap_s"] < 0.05          # dry run: a setpoint every 10 ms from the start
+        # a first setpoint that comes late (the control loop blocked at the mission start) is a setpoint gap
+        late = Mission(Policy(args), E.PrivilegedMap(), np.array([[10.0, 0.0, -2.5]]), 100.0, 10.0, args)
+        late.command(100.7, np.array([0.0, 0.0, -2.5]), np.zeros(3), 0.0)
+        assert math.isclose(late.max_setpoint_gap, 0.7, abs_tol=1e-9), late.max_setpoint_gap
+        same = ("termination", "decisions", "waypoints_reached", "fallback_onsets", "blind_decisions", "primitive_counts")
+        assert all(cold[k] == warm_rec[k] for k in same), {k: (cold[k], warm_rec[k]) for k in same}
+        for k in ("path_length_m", "sigma_bar_max", "min_clearance_m"):
+            assert math.isclose(cold[k], warm_rec[k], rel_tol=1e-9, abs_tol=1e-9), (k, cold[k], warm_rec[k])
 
         # DAgger (sim/dagger.py): the untrained policy flies, the expert labels every frame and takes over
         import h5py
