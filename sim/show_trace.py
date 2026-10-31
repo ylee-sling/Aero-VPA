@@ -22,6 +22,11 @@ feed-forward that the vehicle follows, and how well the closed-loop prediction o
 0.5 s, k 1) and the same without feed-forward match. Traces before 2026-10-31 do not record the feed-forward
 (setpoint_acc); k is then not identifiable and is reported as "-".
 
+--prediction compares, at every check of sim/dagger.py while the expert flew, the smallest clearance it predicted
+for the way it took with the smallest clearance then flown over the same horizon (reaction 0.3 s plus the
+minimum-jerk braking time at the flown speed, at least 0.5 s), kept only when the expert flew all of it: how
+optimistic the predictions are, and the conflict threshold that would cover them (traces since 9c8b3e7).
+
 Angles are degrees: bearings in the heading frame (positive to the right), azimuth / elevation of u_t in the
 camera (right / up positive). Primitives: CRU(ISE) LAT(ERAL_AVOID) VER(TICAL_AVOID) YAW(_SCAN) APP(ROACH)
 BRK (BRAKE_HOVER). Modes: TRACK, BRAKE, HOLD.
@@ -54,6 +59,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--svg", default=None, help="draw the mission (one trace)")
     p.add_argument("--world_json", default=None, help="world sidecar for the trunks (default: from the record)")
     p.add_argument("--response", action="store_true", help="fit the velocity response to the dispatched setpoints")
+    p.add_argument("--prediction", action="store_true", help="the expert's predicted against flown clearance")
     p.add_argument("--self-test", dest="self_test", action="store_true")
     args = p.parse_args(argv)
     if not args.self_test and not args.traces:
@@ -521,6 +527,113 @@ def response_report(paths: Sequence[str], delays: Optional[np.ndarray] = None,
     return fits
 
 
+# ---------------------------------------------------------------------------------------------
+# --prediction: what the expert's closed-loop prediction expected against what was flown
+# ---------------------------------------------------------------------------------------------
+COLLISION_CLEARANCE = 0.35                # fly_policy.py --collision_distance
+
+
+def prediction_checks(record: Dict[str, Any], rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Every check (``dagger_choice``) made while the expert flew, with the smallest clearance predicted for the way it
+    took (and for flying on) and the smallest clearance flown after it over the prediction horizon, when the expert
+    flew all of that horizon (a mission ending in a crash counts up to the crash)."""
+    if not rows:
+        return []
+    t = np.array([float(r["t"]) for r in rows])
+    clr = np.array([math.nan if r.get("clearance") is None else float(r["clearance"]) for r in rows])
+    expert = np.array([r.get("dagger_mode") == "EXPERT" for r in rows])
+    crashed = record.get("termination") in ("collision", "ground")
+    out, seen = [], set()
+    for i, r in enumerate(rows):
+        c, ct = r.get("dagger_choice"), r.get("dagger_choice_t")
+        if not expert[i] or not c or ct is None or ct in seen or not (t[i] - 0.06 <= ct <= t[i] + 0.06):
+            continue
+        seen.add(ct)
+        way = c.get("way")
+        pred = c.get(way) if way else None
+        if pred is None:
+            continue
+        speed = float(np.linalg.norm(r["v"]))
+        horizon = max(0.5, 0.3 + 1.5 * speed / 5.0)
+        after = (t > ct) & (t <= ct + horizon)
+        if not after.any() or (t[-1] < ct + horizon and not crashed):
+            continue
+        idx = np.nonzero(after)[0]
+        if not expert[idx].all() or np.all(np.isnan(clr[idx])):
+            continue
+        out.append({"t": float(ct), "speed": speed, "way": way, "pred": float(pred), "fly": c.get("fly"),
+                    "threshold": float(c.get("threshold", math.nan)), "flown": float(np.nanmin(clr[idx]))})
+    return out
+
+
+def takeover_clearances(rows: List[Dict[str, Any]], after: float = 2.0) -> List[Dict[str, Any]]:
+    """Every handover from the policy to the expert: the clearance and speed at the first expert decision, the reason
+    (``dagger_event``) and the smallest clearance over the next ``after`` seconds."""
+    out = []
+    for i in range(1, len(rows)):
+        if rows[i].get("dagger_mode") != "EXPERT" or rows[i - 1].get("dagger_mode") != "POLICY":
+            continue
+        t0 = float(rows[i]["t"])
+        nxt = [float(r["clearance"]) for r in rows[i:] if r["t"] <= t0 + after and r.get("clearance") is not None]
+        ev = rows[i].get("dagger_event") or [None, "?", "?"]
+        if rows[i].get("clearance") is not None and nxt:
+            out.append({"t": t0, "clearance": float(rows[i]["clearance"]), "speed": float(np.linalg.norm(rows[i]["v"])),
+                        "reason": ev[1], "way": ev[2], "next_min": min(nxt)})
+    return out
+
+
+def prediction_report(paths: Sequence[str]) -> Dict[str, Any]:
+    """Print how optimistic the expert's predictions were (predicted minus flown smallest clearance), and how close
+    to obstacles the policy handed over."""
+    checks: List[Dict[str, Any]] = []
+    handovers: List[Dict[str, Any]] = []
+    used = 0
+    for path in paths:
+        record, rows = load_trace(path)
+        found = prediction_checks(record, rows)
+        used += bool(found)
+        checks.extend(found)
+        handovers.extend(takeover_clearances(rows))
+    if handovers:
+        print(f"handovers from the policy to the expert: {len(handovers)}; clearance at the handover and smallest in the "
+              "next 2 s (m):")
+        for reason in sorted({h["reason"] for h in handovers}):
+            hs = [h for h in handovers if h["reason"] == reason]
+            at, nxt = np.array([h["clearance"] for h in hs]), np.array([h["next_min"] for h in hs])
+            print(f"   {str(reason):16s} {len(hs):5d}   at handover median {np.median(at):.2f}, p10 {np.percentile(at, 10):.2f}, "
+                  f"min {at.min():.2f}; next 2 s median {np.median(nxt):.2f}, p10 {np.percentile(nxt, 10):.2f}, min {nxt.min():.2f}; "
+                  f"below 0.5 m: {int((nxt < 0.5).sum())}")
+    print(f"expert's predicted against flown smallest clearance: {len(checks)} checks in {used} of {len(paths)} traces "
+          "(the expert flying the whole horizon)")
+    if not checks:
+        print("   none: traces before 9c8b3e7 do not record the expert's checks")
+        return {"checks": 0}
+    opt = np.array([c["pred"] - c["flown"] for c in checks])
+
+    def line(label: str, sel: np.ndarray) -> None:
+        if sel.any():
+            q = np.percentile(opt[sel], [50, 90, 95, 99])
+            print(f"   {label:16s} {int(sel.sum()):6d}   {q[0]:+6.2f} {q[1]:+6.2f} {q[2]:+6.2f} {q[3]:+6.2f} {opt[sel].max():+6.2f}")
+
+    print(f"   {'checks':16s} {'n':>6s}   {'median':>6s} {'p90':>6s} {'p95':>6s} {'p99':>6s} {'max':>6s}  (predicted - flown, m)")
+    line("all", np.ones(len(checks), dtype=bool))
+    for way in ("fly", "slow", "stop"):
+        line(f"way {way}", np.array([c["way"] == way for c in checks]))
+    speed = np.array([c["speed"] for c in checks])
+    for label, lo, hi in (("below 1 m/s", 0.0, 1.0), ("1-3 m/s", 1.0, 3.0), ("above 3 m/s", 3.0, math.inf)):
+        line(label, (speed >= lo) & (speed < hi))
+    pred, flown, thr = (np.array([c[k] for c in checks]) for k in ("pred", "flown", "threshold"))
+    kept = pred >= thr
+    miss = kept & (flown < thr)
+    print(f"   predicted to keep the threshold: {int(kept.sum())}; flew below it: {int(miss.sum())}; below the collision "
+          f"line {COLLISION_CLEARANCE} m: {int((flown < COLLISION_CLEARANCE).sum())} (of which predicted kept: "
+          f"{int((kept & (flown < COLLISION_CLEARANCE)).sum())})")
+    p95 = float(np.percentile(opt, 95))
+    print(f"   a threshold covering 95% of these errors: {COLLISION_CLEARANCE} + {p95:.2f} = "
+          f"{COLLISION_CLEARANCE + p95:.2f} m (now 0.45 m in flight, 0.40 m when already inside, 0.50 m at takeovers)")
+    return {"checks": len(checks), "p95": p95, "misses": int(miss.sum())}
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     if args.self_test:
@@ -528,6 +641,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     if args.response:
         response_report(args.traces)
+        return 0
+    if args.prediction:
+        prediction_report(args.traces)
         return 0
     for path in args.traces:
         record, rows = load_trace(path)
@@ -617,6 +733,26 @@ def _self_test() -> None:
         fits = response_report([path], delays=np.array([0.2, 0.24]), taus=np.array([0.5, 0.6]))
         assert fits["expert"]["windows"] > 0 and fits["policy"]["windows"] > 0
         assert fits["all"]["windows"] >= fits["expert"]["windows"] + fits["policy"]["windows"]
+    # --prediction: checks every 50 ms predicting 0.6 m while the flown clearance falls to 0.5 m (0.1 m optimistic)
+    exp_rows = [{"t": round(0.03 * i, 2), "v": [2.0, 0.0, 0.0], "clearance": max(0.5, 1.5 - 0.03 * i),
+                 "dagger_mode": "EXPERT" if 10 <= i < 80 else "POLICY", "dagger_event": [0.3, "obstacle", "fly"],
+                 "dagger_choice": {"way": "fly", "threshold": 0.45, "fly": 0.6}, "dagger_choice_t": round(0.05 * (i * 3 // 5), 2)}
+                for i in range(100)]
+    checks = prediction_checks({"termination": "success"}, exp_rows)
+    assert checks and all(c["way"] == "fly" and c["t"] + 0.9 <= 2.4 + 1e-9 for c in checks)       # expert all along
+    late = [c for c in checks if c["t"] >= 0.15]
+    assert late and all(abs(c["flown"] - 0.5) < 1e-9 for c in late)
+    hand = takeover_clearances(exp_rows)
+    assert len(hand) == 1 and hand[0]["reason"] == "obstacle" and abs(hand[0]["clearance"] - 1.2) < 1e-9
+    assert abs(hand[0]["next_min"] - 0.5) < 1e-9
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "p.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for item in [{"kind": "mission", "termination": "success"}, *({"kind": "decision", **r} for r in exp_rows)]:
+                f.write(json.dumps(item) + "\n")
+        out = prediction_report([path])
+        assert out["checks"] == len(checks) and out["p95"] <= 0.1 + 1e-9 and out["misses"] == 0
+        assert main([path, "--prediction"]) == 0
     print("show_trace.py self-test passed")
 
 
