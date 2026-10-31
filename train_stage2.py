@@ -87,7 +87,12 @@ class LatentStore:
                  only_successful: bool = True) -> None:
         chosen = []                                                          # (source, episode, frames, instruction)
         caches: Dict[str, str] = {}
+        self.empty_sources: List[str] = []                                   # no complete episode: nothing to load
         for source in sources:
+            with h5py.File(source, "r") as f:
+                if not complete_episodes(f):
+                    self.empty_sources.append(source)
+                    continue
             cache = find_cache(latent_dir, source, checkpoint_id)
             if cache is None:
                 raise ValueError(f"{cache_path(latent_dir, source)} is missing or was not built from stage-1 checkpoint "
@@ -545,6 +550,11 @@ def _self_test() -> None:
         cal = ckpt["calibration"]
         store = LatentStore([train_file], latents, load_checkpoint(stage1_path)["checkpoint_id"])
         assert len(store) == 60 and store.tensors["z"].shape == (60, 256)
+        empty = os.path.join(tmp, "empty.hdf5")                     # a DAgger file that recorded nothing, no cache
+        with h5py.File(empty, "w") as f:
+            f.create_group("episode_0000").attrs["complete"] = False
+        store = LatentStore([train_file, empty], latents, load_checkpoint(stage1_path)["checkpoint_id"])
+        assert len(store) == 60 and store.empty_sources == [empty]
         mu_s, sd_s = state_statistics(store.tensors["state"])
         assert torch.allclose(cal["proprio_mean"], mu_s) and torch.allclose(cal["proprio_std"], sd_s)
         assert bool((cal["proprio_std"] > 0).all())

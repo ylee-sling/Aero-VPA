@@ -193,24 +193,27 @@ def cache_latents(args: argparse.Namespace) -> List[str]:
             files_done += 1
             out = None
 
+    def new_cache(source: str) -> h5py.File:
+        f = h5py.File(cache_path(args.out_dir, source) + ".tmp", "w")
+        size, mtime = _source_signature(source)
+        f.attrs.update({"schema": CACHE_SCHEMA, "schema_version": CACHE_VERSION, "stage1_checkpoint_id": ckpt_id,
+                        "gamma_bar_star": gamma, "source_file": os.path.basename(source), "source_bytes": size,
+                        "source_mtime_ns": mtime, "primitive": "expert"})
+        with h5py.File(source, "r") as src:
+            for name in complete_episodes(src):
+                n = src[name]["timestamps"].shape[0]
+                g = f.create_group(name)
+                g.create_dataset("z", shape=(n, cfg.latent_dim), dtype=np.float32)
+                g.create_dataset("z_hat", shape=(n, cfg.latent_dim), dtype=np.float32)
+                g.create_dataset("sigma", shape=(n,), dtype=np.float32)
+        return f
+
     for chunk in loader:
         source = chunk["path"]
         if source != out_source:
             finish()
             out_source = source
-            final = cache_path(args.out_dir, source)
-            out = h5py.File(final + ".tmp", "w")
-            size, mtime = _source_signature(source)
-            out.attrs.update({"schema": CACHE_SCHEMA, "schema_version": CACHE_VERSION, "stage1_checkpoint_id": ckpt_id,
-                              "gamma_bar_star": gamma, "source_file": os.path.basename(source), "source_bytes": size,
-                              "source_mtime_ns": mtime, "primitive": "expert"})
-            with h5py.File(source, "r") as src:
-                for name in complete_episodes(src):
-                    n = src[name]["timestamps"].shape[0]
-                    g = out.create_group(name)
-                    g.create_dataset("z", shape=(n, cfg.latent_dim), dtype=np.float32)
-                    g.create_dataset("z_hat", shape=(n, cfg.latent_dim), dtype=np.float32)
-                    g.create_dataset("sigma", shape=(n,), dtype=np.float32)
+            out = new_cache(source)
         image = normalizer(chunk["rgb"].to(device, non_blocking=True), chunk["depth"].to(device, non_blocking=True)).image
         with autocast(device, args.amp):
             z = encoder(image)
@@ -224,7 +227,13 @@ def cache_latents(args: argparse.Namespace) -> List[str]:
         if frames % (50 * args.chunk) < (b - a):
             print(f"[cache] {frames} frames encoded, {files_done}/{len(todo)} files", flush=True)
     finish()
-    print(f"[cache] done: {frames} frames in {files_done} files -> {args.out_dir}", flush=True)
+    with_frames = {item[0] for item in items}
+    empty = [s for s in todo if s not in with_frames]
+    for source in empty:                  # no complete episode with frames (e.g. a DAgger mission that recorded none):
+        out_source, out = source, new_cache(source)                 # an empty cache records that it is current
+        finish()
+    print(f"[cache] done: {frames} frames in {files_done - len(empty)} files"
+          + (f" (+ {len(empty)} without frames)" if empty else "") + f" -> {args.out_dir}", flush=True)
     return [find_cache(args.out_dir, s, ckpt_id) or cache_path(args.out_dir, s) for s in sources]
 
 
@@ -306,6 +315,21 @@ def _self_test() -> None:
         assert find_cache(out_dir, files[0], cid) is None                   # ... so a lost demo cache is rebuilt
         cache_latents(args)
         assert find_cache(out_dir, files[0], cid) == caches[0]
+
+        # a file without complete episodes (a DAgger mission that recorded nothing, an interrupted writer) gets an
+        # empty cache, current on the next run
+        empty = os.path.join(r1, "c.hdf5")
+        with h5py.File(empty, "w") as f:
+            f.create_group("episode_0000").attrs["complete"] = False
+        eargs = parse_args([ckpt_path, empty, "--out_dir", out_dir, "--num_workers", "0", "--device", "cpu"])
+        cache_latents(eargs)
+        cache = find_cache(out_dir, empty, cid)
+        assert cache is not None and os.path.basename(cache) == "dagger_r1__c.latents.hdf5"
+        with h5py.File(cache, "r") as f:
+            assert list(f.keys()) == []
+        mtime = os.stat(cache).st_mtime_ns
+        cache_latents(eargs)
+        assert os.stat(cache).st_mtime_ns == mtime
     print("cache_latents.py self-test passed")
 
 
