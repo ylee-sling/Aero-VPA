@@ -318,8 +318,13 @@ of obstacles, it flies on from where the vehicle is, still recording, also when 
 on its path the expert steers round it, where a straight stop at speed would run into the next one. Otherwise, and
 after a missed waypoint, it brakes, backs away to 0.8 m from the nearest obstacle, re-plans from there through the
 remaining waypoints and turns to the new path before flying it. While the expert flies, the same prediction runs
-every 50 ms and brakes it before it would come within 0.45 m of an obstacle; after 2 s back on the path the policy
-flies again. Every decision runs the policy as deployed, so S_t holds the setpoint that was actually dispatched.
+every 50 ms; before it would come within 0.45 m of an obstacle, the expert compares flying on, slowing down along its
+path (a speed governor that time-scales the reference, keeping the full correction towards the path) and a straight
+stop, and takes the one that keeps the most clearance: at speed in a forest that is almost always slowing down on the
+path, since a straight stop leaves it. After 2 s back on the path, at full speed again, the policy flies again.
+Each mission starts under the expert: at rest at the start of its path the label is to stay at rest, a fixed
+point for a policy flying from there, so the policy takes over once the reference has left its slow start.
+Every decision runs the policy as deployed, so S_t holds the setpoint that was actually dispatched.
 Frames go to `DIR/<world>.hdf5` in the demonstration schema, one episode per recorded segment, so `cache_latents.py`
 and `train_stage2.py` read them unchanged.
 

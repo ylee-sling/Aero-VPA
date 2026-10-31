@@ -104,6 +104,8 @@ def fly(world: E.PrivilegedMap, planner: E.ExpertPlanner, args: argparse.Namespa
     flown_by = "POLICY"
     end, end_mode, closest_expert = "timeout", None, math.inf
     history: Deque[Tuple[float, str, float, float, float, float]] = deque(maxlen=300)
+    events: List[str] = []
+    seen_takeovers: Counter = Counter()
     tick = 0
     while t < deadline:
         if tick % 3 == 0:                                            # decisions at ~33 Hz
@@ -133,6 +135,11 @@ def fly(world: E.PrivilegedMap, planner: E.ExpertPlanner, args: argparse.Namespa
         stats["tick_s"] += time.perf_counter() - t0
         stats["ticks"] += 1
         flown_by = sup.mode if cmd is not None else "POLICY"
+        if args.debug and sup.takeovers != seen_takeovers:
+            new = [k for k in sup.takeovers if sup.takeovers[k] != seen_takeovers.get(k, 0)]
+            events.append(f"{t:6.2f} {','.join(new)} -> {sup.mode} (speed {float(np.linalg.norm(veh.v)):.2f}, "
+                          f"off the path {sup.reference.offset(veh.p):.2f} m, m={tracker.m})")
+            seen_takeovers = Counter(sup.takeovers)
         if sup.failed:
             end = sup.failed
             break
@@ -144,6 +151,7 @@ def fly(world: E.PrivilegedMap, planner: E.ExpertPlanner, args: argparse.Namespa
             yr = pol_yr if args.policy == "expert" else (
                 float(np.clip(E.wrap_angle(math.atan2(vel[1], vel[0]) - veh.yaw), -1.0, 1.0)) if h > 0.3 else 0.0)
             cmd = (vel, np.zeros(3), yr)
+            sup.dispatched(t, vel, np.zeros(3))
         last_sp = np.asarray(cmd[0], float)
         veh.step(t, dt, *cmd)
         clearance = float(world.distance(veh.p))
@@ -162,6 +170,8 @@ def fly(world: E.PrivilegedMap, planner: E.ExpertPlanner, args: argparse.Namespa
             break
         t = round(t + dt, 2)
         tick += 1
+    if args.debug and events:
+        print("     takeovers: " + "; ".join(events[-12:]))
     summary = sup.finish(end)
     return {"end": end, "mode": end_mode, "t": t, "deadline": deadline, "speed": speed, "closest": closest_expert,
             **summary}
@@ -197,7 +207,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             if r["end"] == "no_plan":
                 continue
             n += 1
-            for key in ("dagger_replans", "dagger_expert_brakes", "dagger_soft_blocked", "dagger_backoffs"):
+            for key in ("dagger_replans", "dagger_slowdowns", "dagger_expert_brakes", "dagger_soft_blocked",
+                        "dagger_backoffs"):
                 totals[key] += r[key]
             for key, v in r["dagger_takeovers"].items():
                 totals["takeover_" + key] += v
@@ -205,7 +216,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 closest.append(r["closest"])
             takeovers = ", ".join(f"{key} {v}" for key, v in r["dagger_takeovers"].items() if v)
             print(f"{name:12s} k={k} {r['speed']:.0f} m/s  {r['end']:9s} {r['mode'] or '':7s} {r['t']:6.1f}/{r['deadline']:5.1f} s"
-                  f"  re-plans {r['dagger_replans']}, expert brakes {r['dagger_expert_brakes']}, blocked "
+                  f"  re-plans {r['dagger_replans']}, slow-downs {r['dagger_slowdowns']}, expert stops "
+                  f"{r['dagger_expert_brakes']}, blocked "
                   f"{r['dagger_soft_blocked']}; closest under the expert {r['closest']:.2f} m; policy share "
                   f"{r['dagger_policy_share'] or 0.0:.2f}; takeovers {takeovers or 'none'}", flush=True)
     print(f"endings: {dict(ends)}")

@@ -265,6 +265,8 @@ class Mission:
             row = self._trace_row(stamp, position, velocity, yaw, q, rates, state, out, readings[0] if readings else None)
             if self.dagger is not None:
                 row["dagger_mode"] = self.dagger.mode
+                if math.isfinite(self.dagger.cap):
+                    row["dagger_cap"] = round(float(self.dagger.cap), 2)     # the expert's speed governor
                 if labelled is not None:
                     row.update(controller=labelled["controller"], tau=_rounded(labelled["tau"]),
                                e_path=_rounded(labelled["e_path"]), label0=_rounded(labelled["label0"]),
@@ -345,7 +347,10 @@ class Mission:
                 self.prev_tick = float(now)
                 self.last_mode, self.last_setpoint = -2, np.array([*vel, yaw_rate])          # -2: the expert
                 return vel, acc, yaw_rate
-        return self.tick(now)
+        vel, acc, yaw_rate = self.tick(now)
+        if self.dagger is not None:
+            self.dagger.dispatched(now, vel, acc)              # the policy's setpoint, for the expert's predictions
+        return vel, acc, yaw_rate
 
     def observe(self, now: float, position: np.ndarray, velocity: np.ndarray) -> Optional[str]:
         """Motion statistics and the termination check at ``now``; the reason when the mission ends."""

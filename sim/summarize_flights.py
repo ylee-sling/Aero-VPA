@@ -131,6 +131,7 @@ def _dagger_stats(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             crash_modes[mode] = crash_modes.get(mode, 0) + 1
     return {"dagger_missions": n, "dagger_policy_share": _median([x for x in shares if x is not None]),
             "dagger_takeovers": reasons, "dagger_replans": float(np.mean([r.get("dagger_replans", 0) for r in records])),
+            "dagger_slowdowns": float(np.mean([r.get("dagger_slowdowns", 0) for r in records])),
             "dagger_expert_brakes": float(np.mean([r.get("dagger_expert_brakes", 0) for r in records])),
             "dagger_soft_blocked": float(np.mean([r.get("dagger_soft_blocked", 0) for r in records])),
             "dagger_crash_modes": crash_modes,
@@ -207,8 +208,8 @@ def report(data: Dict[str, Dict[Tuple[str, int], Dict[str, Any]]], by: Optional[
             ("DAgger: frames / mission (pol/exp)", lambda st: f"{st['dagger_frames_policy']:.0f} / "
              f"{st['dagger_frames_expert']:.0f}" if "dagger_missions" in st else "-"),
             ("DAgger: re-plans / mission", lambda st: f"{st['dagger_replans']:.2f}" if "dagger_missions" in st else "-"),
-            ("  expert brakes / way back blocked", lambda st: f"{st['dagger_expert_brakes']:.2f} / "
-             f"{st['dagger_soft_blocked']:.2f}" if "dagger_missions" in st else "-"),
+            ("  expert slow-downs / stops / blocked", lambda st: f"{st['dagger_slowdowns']:.2f} / "
+             f"{st['dagger_expert_brakes']:.2f} / {st['dagger_soft_blocked']:.2f}" if "dagger_missions" in st else "-"),
             ("  crashes by who flew", lambda st: (", ".join(f"{k} {v}" for k, v in sorted(st["dagger_crash_modes"].items()))
                                                   or "none") if "dagger_missions" in st else "-"),
         ]
