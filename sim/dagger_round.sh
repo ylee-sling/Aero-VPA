@@ -12,8 +12,9 @@
 # Round N writes dagger_r<N>/<world>.hdf5 (demonstration schema; one episode per recorded segment), the flight
 # records dagger_r<N>_i<k>.jsonl, checkpoints/policy_r<N>.pt and checkpoints/policy_r<N>_cal_ep.pt, and logs in
 # logs/dagger_r<N>/. Stage (ii) is trained like --like (default: the flying policy): its steps, batch size, learning
-# rate, EMA, class weights, validation split and policy_state_inputs, read from the checkpoint, so rounds differ
-# only in their data. Frames of the DAgger rounds are drawn --weight times as often as demonstration frames.
+# rate, EMA, class weights, validation split, policy_state_inputs, state dropout and change weighting, read from the
+# checkpoint, so rounds differ only in their data. Frames of the DAgger rounds are drawn --weight times as often as
+# demonstration frames.
 # Every step is resumable: rerunning the same command continues where it stopped (flights are counted in the
 # records, caches are reused, training resumes from its state file).
 #
@@ -145,6 +146,10 @@ prov, cfg = ckpt["provenance"], config_from_dict(ckpt["config"])
 args = ["--steps", str(prov["steps"]), "--batch_size", str(prov["batch_size"]), "--lr", repr(prov["lr"]),
         "--ema", repr(prov["ema"]), "--class_weights", str(prov["class_weights"]),
         "--policy_state_inputs", *cfg.policy_state_inputs]
+if prov.get("state_dropout"):
+    args += ["--state_dropout", repr(prov["state_dropout"]["p"]), "--state_dropout_groups", *prov["state_dropout"]["groups"]]
+if prov.get("change_weight"):
+    args += ["--change_weight", repr(prov["change_weight"]["scale"]), "--change_weight_max", repr(prov["change_weight"]["max"])]
 split = prov.get("split") or {}
 if split.get("val"):
     args += ["--val", *split["val"]]

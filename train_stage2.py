@@ -18,6 +18,13 @@ on expert chunks A_t (heading frame of their capture time) divided by the half-w
 --policy_state_inputs withholds groups of S_t from the selector and from e_t (they enter at their training mean;
 P_omega still receives a_bar): e.g. "velocity attitude rates" leaves out the last command a_bar, which is within
 a few cm/s of the expert's next command and lets a policy repeat it instead of using the image (input_sensitivity.py).
+Two ways to keep all inputs at deployment and still make copying them unprofitable:
+--state_dropout P replaces the groups --state_dropout_groups (default: velocity and the last command) of a training
+frame by their training mean, together, with probability P (validation and deployment see all of S_t);
+--change_weight SCALE draws each frame in proportion to min(1 + e / SCALE, --change_weight_max), where
+e = |A_t[0] - a_bar_t| is the error of the copy rule "repeat the last command" (first knot against the last
+dispatched command, m/s and rad/s): the frames where the expert changes its command (avoidance onsets, the
+corrections of stage iii) count most, as in keyframe-focused imitation (Wen et al., ICML 2021).
 mu_S and sigma_S are computed here from the training frames and fixed before training; the selector reads
 its inputs through the same standardisation. c_text is the learned null embedding for episodes without an
 instruction and the frozen CLIP embedding otherwise (computed once per distinct instruction).
@@ -63,7 +70,7 @@ from dataset import episode_split, expand_paths
 from train_stage1 import RunLog, cosine_lr, data_summary, param_groups, pick_device, set_seed
 
 __all__ = ["LatentStore", "FrameSampler", "InstructionTable", "state_statistics", "evaluate_stage2", "train_stage2",
-           "parse_args"]
+           "parse_args", "change_weights", "drop_state"]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -171,9 +178,12 @@ class FrameSampler:
 
     Weighted draws are two-stage: the number of frames from each weight group is multinomial with probabilities
     proportional to (frames in the group) x (factor), then frames are drawn uniformly within each group.
+    With ``frame_weight`` (one non-negative weight per frame, e.g. ``change_weights``) every frame is drawn with
+    probability proportional to (factor of its file) x (its weight), by inverting the cumulative distribution.
     """
 
-    def __init__(self, store: "LatentStore", weights: Sequence[str], generator: torch.Generator) -> None:
+    def __init__(self, store: "LatentStore", weights: Sequence[str], generator: torch.Generator,
+                 frame_weight: Optional[Tensor] = None) -> None:
         self.n, self.gen, self.device = len(store), generator, store.device
         factors = []
         for source in store.sources:
@@ -200,8 +210,24 @@ class FrameSampler:
         self.shares = {f"{int((per_frame == v).sum())} frames x {v:g}": float(p) for v, p in
                        zip(sorted({f for f in factors if f > 0.0 and bool((per_frame == f).any())}), self.probs.tolist(),
                            strict=True)}
+        self.cdf: Optional[Tensor] = None
+        if frame_weight is not None:
+            w = frame_weight.detach().double().cpu().flatten()
+            if w.numel() != self.n or not bool(torch.isfinite(w).all()) or bool((w < 0).any()):
+                raise ValueError("frame_weight needs one finite, non-negative weight per frame")
+            mass = per_frame * w
+            if float(mass.sum()) <= 0.0:
+                raise ValueError("the frame weights leave no frames to train on")
+            cdf = torch.cumsum(mass, dim=0)
+            self.cdf = (cdf / cdf[-1]).to(self.device)
+            self.uniform = False
+            self.shares = {f"{int((per_frame == v).sum())} frames x {v:g}": float(mass[per_frame == v].sum() / mass.sum())
+                           for v in sorted({f for f in factors if f > 0.0 and bool((per_frame == f).any())})}
 
     def draw(self, batch_size: int) -> Tensor:
+        if self.cdf is not None:
+            u = torch.rand(batch_size, generator=self.gen, device=self.device, dtype=torch.float64)
+            return torch.searchsorted(self.cdf, u, right=True).clamp_(max=self.n - 1)
         if self.uniform:
             return torch.randint(self.n, (batch_size,), generator=self.gen, device=self.device)
         counts = torch.multinomial(self.probs, batch_size, replacement=True,
@@ -215,6 +241,23 @@ class FrameSampler:
             self._cpu = torch.Generator().manual_seed(int(torch.randint(2 ** 31, (1,), generator=self.gen,
                                                                          device=self.device).item()))
         return self._cpu
+
+
+def change_weights(store: "LatentStore", scale: float, cap: float) -> Tensor:
+    """min(1 + e / scale, cap) per frame, e = |A_t[0] - a_bar_t|: how far the first knot of the expert's chunk is
+    from the last dispatched command (S_t[9:13]), i.e. the error of the rule "repeat the last command"."""
+    if not (scale > 0.0 and cap >= 1.0):
+        raise ValueError(f"--change_weight needs a positive scale and --change_weight_max >= 1, got {scale}, {cap}")
+    a, b = STATE_GROUPS["last_command"]
+    e = (store.tensors["actions"][:, 0, :].double() - store.tensors["state"][:, a:b].double()).norm(dim=1)
+    return (1.0 + e / scale).clamp(max=cap).cpu()
+
+
+def drop_state(state: Tensor, columns: Tensor, mean: Tensor, p: float, generator: torch.Generator) -> Tensor:
+    """S_t with ``columns`` replaced by their training mean (as if withheld) in a random share ``p`` of the rows."""
+    rows = torch.rand(state.shape[0], generator=generator, device=state.device) < p
+    return torch.where(rows[:, None] & columns.to(state.device)[None, :], mean.to(state.device, state.dtype)[None, :],
+                       state)
 
 
 def state_statistics(state: Tensor, eps: float = 1e-6) -> tuple:
@@ -277,6 +320,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="draw frames of files matching PATTERN FACTOR times as often (repeatable)")
     p.add_argument("--policy_state_inputs", nargs="+", choices=list(STATE_GROUPS), default=None,
                    help="groups of S_t the selector and the CFM conditioning see (default: all four, Eq. 2)")
+    p.add_argument("--state_dropout", type=float, default=0.0,
+                   help="share of training frames whose --state_dropout_groups are replaced by their training mean")
+    p.add_argument("--state_dropout_groups", nargs="+", choices=list(STATE_GROUPS), default=["velocity", "last_command"])
+    p.add_argument("--change_weight", type=float, default=0.0, metavar="SCALE",
+                   help="draw frames in proportion to min(1 + |A_t[0] - a_bar_t| / SCALE, --change_weight_max) (0: off)")
+    p.add_argument("--change_weight_max", type=float, default=10.0)
     p.add_argument("--device", default="auto")
     p.add_argument("--data_on_gpu", choices=["auto", "yes", "no"], default="auto")
     p.add_argument("--seed", type=int, default=0)
@@ -290,7 +339,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args = p.parse_args(argv)
     if not args.self_test and (not args.stage1 or not args.data):
         p.error("give the stage-1 checkpoint and demonstration files (or --self-test)")
+    if not 0.0 <= args.state_dropout < 1.0:
+        p.error("--state_dropout must be in [0, 1)")
+    if args.change_weight < 0.0 or args.change_weight_max < 1.0:
+        p.error("--change_weight must be >= 0 and --change_weight_max >= 1")
     return args
+
+
+def _recipe(args: argparse.Namespace) -> Dict[str, Any]:
+    """The options that change what a step trains on; a resume must keep them."""
+    return {"policy_state_inputs": list(args.policy_state_inputs or []),
+            "state_dropout": float(args.state_dropout),
+            "state_dropout_groups": list(args.state_dropout_groups) if args.state_dropout > 0 else [],
+            "change_weight": float(args.change_weight),
+            "change_weight_max": float(args.change_weight_max) if args.change_weight > 0 else None}
 
 
 def _ema_update(ema: nn.Module, model: nn.Module, decay: float) -> None:
@@ -380,6 +442,9 @@ def train_stage2(args: argparse.Namespace) -> str:
     if args.policy_state_inputs:
         overrides["policy_state_inputs"] = tuple(args.policy_state_inputs)
     cfg = config_from_dict(stage1["config"], **overrides)
+    if args.state_dropout > 0 and not set(args.state_dropout_groups) <= set(cfg.policy_state_inputs):
+        raise SystemExit(f"--state_dropout_groups {args.state_dropout_groups} must be among the groups the policy sees "
+                         f"({list(cfg.policy_state_inputs)})")
     gamma = float(stage1["calibration"]["gamma_bar_star"])
     mu_z = stage1["calibration"]["latent_mean"].float()
     train, val = _stores(args, stage1["checkpoint_id"])
@@ -418,10 +483,14 @@ def train_stage2(args: argparse.Namespace) -> str:
         if not os.path.isfile(state_path):
             raise FileNotFoundError(f"--resume: no training state {state_path}")
         state = torch.load(state_path, map_location=device, weights_only=True)
+        saved = argparse.Namespace(**{**vars(parse_args(["--self-test"])), **(state.get("args") or {})})
         saved_inputs = (state.get("args") or {}).get("policy_state_inputs")
         if list(saved_inputs or []) != list(args.policy_state_inputs or []):
             raise SystemExit(f"--resume: {state_path} was trained with --policy_state_inputs {saved_inputs}, "
                              f"not {args.policy_state_inputs}")
+        if _recipe(saved) != _recipe(args):
+            raise SystemExit(f"--resume: {state_path} was trained with {_recipe(saved)}, not {_recipe(args)} "
+                             "(--state_dropout, --change_weight)")
         policy.load_state_dict(state["policy"])
         if ema is not None and state.get("ema") is not None:
             ema.load_state_dict(state["ema"])
@@ -446,15 +515,33 @@ def train_stage2(args: argparse.Namespace) -> str:
         frames=len(train), steps=total, instructions=instructions, primitive_counts=counts.long().tolist(),
         policy_state_inputs=list(cfg.policy_state_inputs))
     gen = torch.Generator(device=train.device).manual_seed(args.seed)
-    sampler = FrameSampler(train, args.source_weight, gen)
+    frame_weight = change_weights(train, args.change_weight, args.change_weight_max) if args.change_weight > 0 else None
+    sampler = FrameSampler(train, args.source_weight, gen, frame_weight=frame_weight)
     if not sampler.uniform:
         log("sampling", "frames drawn per batch: " + ", ".join(f"{k}: {100 * v:.1f}%" for k, v in sampler.shares.items()),
             shares=sampler.shares)
+    if frame_weight is not None:
+        q = torch.quantile(frame_weight[torch.randperm(len(frame_weight))[:100000]].float(),
+                           torch.tensor([0.5, 0.9, 0.99]))
+        log("sampling", f"--change_weight {args.change_weight:g} (max {args.change_weight_max:g}): frame weight median / "
+            f"p90 / p99 {q[0]:.2f} / {q[1]:.2f} / {q[2]:.2f}, mean {float(frame_weight.mean()):.2f}",
+            change_weight=args.change_weight, change_weight_max=args.change_weight_max)
+    drop_cols = torch.zeros(13, dtype=torch.bool)
+    for name in args.state_dropout_groups:
+        lo, hi = STATE_GROUPS[name]
+        drop_cols[lo:hi] = True
+    drop_gen = torch.Generator(device=device).manual_seed(args.seed + 1)
+    if args.state_dropout > 0:
+        log("dropout", f"--state_dropout {args.state_dropout:g}: {', '.join(args.state_dropout_groups)} replaced by their "
+            "training mean in that share of the training frames (validation and deployment see all of S_t)",
+            state_dropout=args.state_dropout, groups=list(args.state_dropout_groups))
     last_save, t_log = time.time(), time.time()
     out: Dict[str, Tensor] = {}
     while step < total:
         idx = sampler.draw(args.batch_size)
         batch = train.batch(idx, device)
+        if args.state_dropout > 0:
+            batch["state"] = drop_state(batch["state"], drop_cols, mu_s, args.state_dropout, drop_gen)
         for group in optimizer.param_groups:
             group["lr"] = cosine_lr(step, total, args.lr, args.warmup_steps)
         out = _losses(policy, batch, cfg.lambda_h, class_weight)
@@ -505,6 +592,10 @@ def train_stage2(args: argparse.Namespace) -> str:
                   "primitive_counts": counts.long().tolist(), "stage1_provenance": stage1["provenance"],
                   "split": {"val": args.val, "val_fraction": args.val_fraction, "split_seed": args.split_seed},
                   "source_weight": list(args.source_weight),
+                  "state_dropout": {"p": args.state_dropout, "groups": list(args.state_dropout_groups)}
+                  if args.state_dropout > 0 else None,
+                  "change_weight": {"scale": args.change_weight, "max": args.change_weight_max}
+                  if args.change_weight > 0 else None,
                   **environment_info()}
     ckpt = make_checkpoint("policy", cfg, states, calibration, provenance)
     save_checkpoint(args.out, ckpt)
@@ -601,6 +692,58 @@ def _self_test() -> None:
         share = float((both.tensors["source"][draws] == 1).float().mean())
         assert abs(share - 0.6) < 0.03, share                                    # 30 x 3 / (60 x 1 + 30 x 3)
         assert not bool((both.tensors["source"][FrameSampler(both, [f"{train_file}=0"], g).draw(256)] == 0).any())
+        # --change_weight: frames drawn in proportion to the error of "repeat the last command", times the file factor
+        cw = change_weights(both, 0.1, 10.0)
+        e = (both.tensors["actions"][:, 0, :].double() - both.tensors["state"][:, 9:13].double()).norm(dim=1)
+        assert cw.shape == (90,) and torch.allclose(cw, (1.0 + e / 0.1).clamp(max=10.0))
+        fw = torch.ones(len(both))
+        fw[both.tensors["source"] == 1] = 3.0
+        by_frame = FrameSampler(both, [], g, frame_weight=fw)
+        draws = torch.cat([by_frame.draw(512) for _ in range(20)])
+        assert not by_frame.uniform and abs(float((both.tensors["source"][draws] == 1).float().mean()) - 0.6) < 0.03
+        both_ways = FrameSampler(both, ["*val.hdf5=3"], g, frame_weight=fw)          # 30 x 9 / (60 + 270)
+        draws = torch.cat([both_ways.draw(512) for _ in range(20)])
+        assert abs(float((both.tensors["source"][draws] == 1).float().mean()) - 270 / 330) < 0.03
+        assert abs(sum(both_ways.shares.values()) - 1.0) < 1e-9
+        single = torch.zeros(len(both))
+        single[5] = 1.0
+        assert bool((FrameSampler(both, [], g, frame_weight=single).draw(64) == 5).all())
+        for bad in (torch.zeros(len(both)), -torch.ones(len(both)), torch.ones(3)):
+            try:
+                FrameSampler(both, [], g, frame_weight=bad)
+                raise AssertionError("expected a frame-weight error")
+            except ValueError:
+                pass
+        # --state_dropout: the chosen columns of a share p of the rows become the training mean, the rest is untouched
+        st = torch.randn(2000, 13)
+        cols = torch.zeros(13, dtype=torch.bool)
+        cols[0:3] = True
+        cols[9:13] = True
+        d = drop_state(st, cols, torch.full((13,), 7.0), 0.5, torch.Generator().manual_seed(0))
+        dropped = d[:, 0] == 7.0
+        assert 0.45 < float(dropped.float().mean()) < 0.55
+        assert torch.equal(d[~dropped], st[~dropped]) and bool((d[dropped][:, cols] == 7.0).all())
+        assert torch.equal(d[dropped][:, ~cols], st[dropped][:, ~cols])
+        recipe_path = os.path.join(tmp, "policy_recipe.pt")
+        recipe = [stage1_path, train_file, val_file, "--latents", latents, "--out", recipe_path, "--batch_size", "16",
+                  "--device", "cpu", "--log_every", "100", "--val_fraction", "0", "--warmup_steps", "1",
+                  "--state_dropout", "0.5", "--change_weight", "0.1"]
+        train_stage2(parse_args(recipe + ["--steps", "2"]))
+        rprov = load_checkpoint(recipe_path, kind="policy")["provenance"]
+        assert rprov["state_dropout"] == {"p": 0.5, "groups": ["velocity", "last_command"]}
+        assert rprov["change_weight"] == {"scale": 0.1, "max": 10.0} and ckpt["provenance"]["state_dropout"] is None
+        try:
+            train_stage2(parse_args(recipe[:-4] + ["--steps", "3", "--resume"]))     # without the two options
+            raise AssertionError("resumed with another recipe")
+        except SystemExit as exc:
+            assert "--state_dropout" in str(exc), exc
+        train_stage2(parse_args(recipe + ["--steps", "3", "--resume"]))
+        assert load_checkpoint(recipe_path, kind="policy")["provenance"]["steps"] == 3
+        try:                                                                         # a withheld group cannot drop out
+            train_stage2(parse_args(recipe + ["--steps", "2", "--policy_state_inputs", "velocity", "attitude", "rates"]))
+            raise AssertionError("dropout of a withheld group")
+        except SystemExit as exc:
+            assert "--state_dropout_groups" in str(exc), exc
         # --policy_state_inputs: the last command a_bar withheld from the selector and e_t, kept in the checkpoint
         masked_path = os.path.join(tmp, "policy_no_command.pt")
         masked = [stage1_path, train_file, "--latents", latents, "--out", masked_path, "--batch_size", "16",
