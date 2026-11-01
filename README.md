@@ -123,6 +123,7 @@ python envelope_check.py --self-test
 python sim/show_trace.py --self-test
 python input_sensitivity.py --self-test
 python sim/dagger.py       # stage (iii): expert labels, takeover gate and recording on a kinematic vehicle
+python sim/shield.py       # onboard safety shield (fly_policy.py --shield): depth memory, barrier, backoff
 
 # the release checks: headers, licence files, citation metadata, lint and all self-tests
 python scripts/check_release.py --run-tests
@@ -370,6 +371,7 @@ vehicle, and it counts crashes by who was flying, re-plans, expert brakes and fa
 | `sim/summarize_flights.py` | Sec. 5 | success rates, failure modes and paired comparison of policies |
 | `sim/show_trace.py` | Sec. 5 | one traced mission decision by decision (`fly_policy.py --trace`), with an SVG |
 | `sim/dagger.py` | Sec. 3.8 (iii) | DAgger: expert labels at the policy's states, takeover gate, segment recording |
+| `sim/shield.py` | | Onboard safety shield for evaluation (`fly_policy.py --shield`): depth memory, barrier on remembered obstacles, blind-motion cap, latency and uncertainty holds, altitude floor, breadcrumb backoff; no map |
 | `sim/dagger_round.sh` | Sec. 3.8 (iii) | one DAgger round: flights, latent caches, stage (ii) on the aggregate, calibration |
 | `envelope_check.py` | Secs. 3.3-3.6 | envelope and blind rule on expert flights; the policy on the same frames, open loop |
 | `input_sensitivity.py` | Secs. 3.3-3.4 | which inputs the policy's decision follows (one input swapped between frames at a time) |

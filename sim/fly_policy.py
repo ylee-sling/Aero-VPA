@@ -35,6 +35,10 @@ decisions, sigma_bar, the speed scale s_t, primitive counts, decision latency (c
 every frame with its own command for the state the vehicle is in and takes over before trouble; the frames go to
 DIR/<world>.hdf5 in the demonstration schema (sim/dagger_round.sh runs a whole round).
 
+--shield flies with the onboard safety shield of sim/shield.py (no map: depth memory, barrier on remembered
+obstacles, blind-motion cap, sigma and latency holds, altitude floor, breadcrumb backoff and a nudge toward the
+waypoint); the record's "shield" field gives its interventions. It does not combine with --dagger_dir.
+
 --trace DIR also writes every decision of every mission to DIR/<tag>_<world>_e<k>.jsonl (the first line is the
 mission record): the state estimate, the active waypoint, the selected and final primitive, sigma and the gate,
 the raw and committed first knot, d_t with the blind reason and the direction in the camera, v_safe and s_t,
@@ -76,6 +80,7 @@ from collect_expert_dataset import OdometryBuffer, WriterProcess, _ignore_sigint
 from dagger import TRIGGERS, DaggerSupervisor, GateConfig, InlineWriter, plan_now  # noqa: E402
 from dagger import file_attributes as dagger_file_attributes  # noqa: E402
 from pipeline import MODE_TRACK, VPAInferencePipeline  # noqa: E402
+from shield import SafetyShield, ShieldConfig  # noqa: E402
 
 RESULT_VERSION = 1
 CRASHES = ("collision", "ground")
@@ -115,6 +120,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="decisions on a synthetic frame before the first mission, so that its first decision does not "
                         "freeze the control loop with lazy GPU initialisation (0: off)")
     p.add_argument("--dry_run", action="store_true", help="kinematic model and ray-cast camera, no ROS (plumbing only)")
+    sh = p.add_argument_group("onboard safety shield (sim/shield.py)")
+    sh.add_argument("--shield", action="store_true", help="filter the executor's setpoints with the onboard shield")
+    for name, help_text in (("radius", "barrier zero, centre to a remembered return (m)"),
+                            ("hard_radius", "back off when closer (m)"), ("blind_speed", "unseen horizontal motion (m/s)"),
+                            ("sigma_speed", "speed while sigma_bar > sigma_lo (m/s)"), ("backoff_m", "retrace (m)"),
+                            ("stall_s", "nudge after this long without progress (s)"), ("memory_s", "memory (s)")):
+        sh.add_argument("--shield_" + name, type=float, default=None,
+                        help=f"{help_text}; default {getattr(ShieldConfig(), name)}")
     dag = p.add_argument_group("DAgger (stage iii, sim/dagger.py)")
     dag.add_argument("--dagger_dir", default=None, metavar="DIR",
                      help="record every frame with the expert's label to DIR/<world>.hdf5; the expert takes over when needed")
@@ -227,6 +240,12 @@ class Mission:
         self.last_acc = np.zeros(3)                         # acceleration feed-forward of the last setpoint (traces)
         self.gap_since_row = 0.0                            # longest gap between setpoints since the last trace row
         self.trace: Optional[List[Dict[str, Any]]] = [] if getattr(args, "trace", None) else None
+        self.shield: Optional[SafetyShield] = None
+        if getattr(args, "shield", False):
+            if dagger is not None:
+                raise ValueError("--shield does not combine with --dagger_dir (the expert is the gate there)")
+            self.shield = SafetyShield(ShieldConfig.from_args(args), policy.depth_range)
+            self.shield.reset(self.t0)
 
     @torch.no_grad()
     def decide(self, stamp: float, rgb: np.ndarray, depth: np.ndarray, position: np.ndarray, velocity: np.ndarray,
@@ -259,6 +278,9 @@ class Mission:
         started = time.perf_counter()
         out = p.pipe.step(image, state, torch.as_tensor(position, **f32)[None], torch.tensor([yaw], **f32), clearance,
                           float(stamp))
+        if self.shield is not None:
+            self.shield.on_frame(float(stamp), depth_m, rotation, np.asarray(position, dtype=np.float64),
+                                 float(out.sigma_bar[0]), p.cfg.sigma_lo)
         self.latency.append(time.perf_counter() - started)
         if clock is not None:
             self.age.append(float(clock()) - float(stamp))
@@ -279,6 +301,8 @@ class Mission:
                                             bool(out.task_complete[0]), position, yaw, odometry_age)
         if self.trace is not None:
             row = self._trace_row(stamp, position, velocity, yaw, q, rates, state, out, readings[0] if readings else None)
+            if self.shield is not None:
+                row["shield"] = "/".join((self.shield.mode,) + tuple(self.shield.reasons))
             if self.dagger is not None:
                 row["dagger_mode"] = self.dagger.mode
                 if math.isfinite(self.dagger.cap):
@@ -374,6 +398,25 @@ class Mission:
                 self.prev_tick = float(now)
                 self.last_mode, self.last_setpoint, self.last_acc = -2, np.array([*vel, yaw_rate]), acc   # -2: expert
                 return vel, acc, yaw_rate
+        if self.shield is not None:
+            m = int(self.policy.pipe.waypoint_index[0])
+            done = bool(self.policy.pipe.task_complete[0])
+            target = None if done else self.waypoints[min(max(m, 1), len(self.waypoints)) - 1]
+            out = self.shield.step(now, position, velocity, yaw, target, lambda: self.tick(now))
+            vel, acc, yaw_rate = out.velocity, out.acceleration, out.yaw_rate
+            v32 = torch.as_tensor(vel, dtype=torch.float32)[None]
+            r32 = torch.tensor([yaw_rate], dtype=torch.float32)
+            if out.takeover:                                    # the shield flies: no executor tick
+                self.policy.pipe.external_setpoint(v32, r32)
+                if self.prev_tick is not None:
+                    self.max_setpoint_gap = max(self.max_setpoint_gap, float(now) - self.prev_tick)
+                    self.gap_since_row = max(self.gap_since_row, float(now) - self.prev_tick)
+                self.prev_tick = float(now)
+                self.last_mode = -3                             # -3: the shield
+            elif out.changed:
+                self.policy.pipe.override_last_setpoint(v32, r32)
+            self.last_setpoint, self.last_acc = np.array([*vel, yaw_rate]), np.asarray(acc, dtype=np.float64)
+            return vel, acc, yaw_rate
         vel, acc, yaw_rate = self.tick(now)
         if self.dagger is not None:
             self.dagger.dispatched(now, vel, acc)              # the policy's setpoint, for the expert's predictions
@@ -433,6 +476,7 @@ class Mission:
             "dropped_frames": self.dropped_frames, "max_decision_gap_s": self.max_decision_gap,
             "wall_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
             **(self.dagger.summary() if self.dagger is not None else {}),
+            "shield": self.shield.summary() if self.shield is not None else None,
         }
 
 
@@ -1154,6 +1198,24 @@ def _self_test() -> None:
         assert not np.allclose(mission_for(world, args, 0, home, attempt=1), records[0]["waypoints_ned"])
         out = report(load([results]))
         assert out["stats"]["policy.pt"]["missions"] == 2 and out["stats"]["again"]["missions"] == 1
+        # --shield: the same missions flown through the onboard shield; its interventions are in the record and
+        # in the trace rows, and an unshielded record says so
+        shielded = os.path.join(tmp, "shielded.jsonl")
+        assert run_dry(parse_args(base[:-4] + ["--results", shielded, "--device", "cpu", "--episodes", "2", "--shield",
+                                               "--tag", "shield", "--trace", trace_dir])) == 0
+        srecs = [json.loads(line) for line in open(shielded, encoding="utf-8")]
+        assert all(r["shield"] is not None and r["shield"]["memory_points"] >= 0 for r in srecs) and records[0]["shield"] is None
+        assert all({"backoffs", "nudges", "stalls", "holds", "seconds", "config"} <= set(r["shield"]) for r in srecs)
+        assert all(r["termination"] in ("success", "timeout", "collision", "ground", "out_of_bounds", "camera_timeout")
+                   for r in srecs)
+        srows = [json.loads(line) for line in open(srecs[0]["trace"], encoding="utf-8")][1:]
+        assert srows and all("shield" in row for row in srows)
+        try:
+            Mission(Policy(args), E.PrivilegedMap(), np.array([[10.0, 0.0, -2.5]]), 0.0, 10.0,
+                    parse_args(base + ["--shield"]), dagger=object())
+            raise AssertionError("--shield with DAgger")
+        except ValueError:
+            pass
         assert records[0]["warmup_ms"] and len(records[0]["warmup_ms"]) == args.warmup == 3     # on by default
 
         # the warm-up runs decisions of a throwaway mission and changes nothing in the real ones

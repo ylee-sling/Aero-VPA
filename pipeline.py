@@ -749,6 +749,23 @@ class VPAInferencePipeline(nn.Module):
         self._last_mode = torch.full_like(self._last_mode, MODE_HOLD)
         self._braking = torch.zeros_like(self._braking)
 
+    def override_last_setpoint(self, velocity_ned: Tensor, yaw_rate: Tensor) -> None:
+        """Replace the setpoint the executor just produced by the one actually dispatched after a safety filter
+        changed it (sim/shield.py): it becomes a_bar of the next decision and the point a later hold or brake
+        starts from; unlike ``external_setpoint`` the executor's mode is kept and it keeps ticking.
+
+        Args:
+            velocity_ned: ``[B, 3]`` NED velocity setpoint (m/s).
+            yaw_rate: ``[B]`` yaw-rate setpoint (rad/s).
+        """
+        self._require_episode()
+        b, device = self._last_setpoint.shape[0], self._last_setpoint.device
+        v = torch.as_tensor(velocity_ned, dtype=torch.float32, device=device)
+        r = torch.as_tensor(yaw_rate, dtype=torch.float32, device=device)
+        if tuple(v.shape) != (b, 3) or tuple(r.shape) != (b,):
+            raise ValueError(f"expected velocity_ned [{b}, 3] and yaw_rate [{b}], got {tuple(v.shape)}, {tuple(r.shape)}")
+        self._last_setpoint = torch.cat([v, r.unsqueeze(-1)], dim=-1)
+
     # ------------------------------------------------------------------ state accessors
     @property
     def waypoint_index(self) -> Optional[Tensor]:
@@ -1112,6 +1129,12 @@ def _self_test() -> None:
     assert resumed.mode.tolist() == [MODE_TRACK] * b
     assert _close(resumed.velocity, v_ext) and _close(resumed.yaw_rate, r_ext)        # lambda = 0: the expert's setpoint
     _expect(ValueError, lambda: pipe.external_setpoint(v_ext[:, :2], r_ext))
+    # a filtered setpoint (sim/shield.py) becomes a_bar; the executor keeps tracking
+    pipe.override_last_setpoint(v_ext * 0.5, r_ext * 0.5)
+    s_filt = pipe.proprioception(torch.zeros(b, 3), torch.tensor([[0.0, 0.0, 1.0]] * b), torch.zeros(b, 3), yaw)
+    assert _close(s_filt[:, 9:12], world_to_heading(v_ext * 0.5, yaw)) and _close(s_filt[:, 12], r_ext * 0.5)
+    assert pipe.tick(10.51).mode.tolist() == [MODE_TRACK] * b
+    _expect(ValueError, lambda: pipe.override_last_setpoint(v_ext[:, :2], r_ext))
 
     # ---- Argument checks.
     pipe.reset("x", waypoints)
