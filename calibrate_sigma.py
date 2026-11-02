@@ -492,8 +492,13 @@ def _self_test() -> None:
                                    "--num_workers", "0", "--device", "cpu"]))
         written = load_checkpoint(out_ep, kind="policy")
         assert ep["method"] == "episode_max" and written["config"]["sigma_crit"] == ep["episode_max"]["sigma_crit"]
-        assert written["config"]["sigma_lo"] == ep["sigma_lo"] == report["sigma_lo"]
-        assert ep["frame"]["sigma_crit"] == report["sigma_crit"] and ep["episode_max"]["flights"] == 2
+        assert written["config"]["sigma_lo"] == ep["sigma_lo"]
+        # two calibration runs of the same checkpoint agree up to float noise: CPU kernels need not be bitwise
+        # reproducible from one call to the next (the exact comparison failed on the CI runners' CPU build of torch)
+        assert np.isclose(ep["sigma_lo"], report["sigma_lo"], rtol=1e-5, atol=0.0), (ep["sigma_lo"], report["sigma_lo"])
+        assert np.isclose(ep["frame"]["sigma_crit"], report["sigma_crit"], rtol=1e-5, atol=0.0), (
+            ep["frame"]["sigma_crit"], report["sigma_crit"])
+        assert ep["episode_max"]["flights"] == 2, ep["episode_max"]["flights"]
         maxima = [float(b.max()) for b in ref_bar]
         assert ep["episode_max"]["sigma_crit"] > max(maxima) and not ep["resolved"]       # 2 flights: unresolved
         assert written["provenance"]["sigma_calibration"]["episode_max"]["bootstrap"] == 20
