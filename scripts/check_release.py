@@ -59,7 +59,8 @@ SELF_TESTS = ("config.py", "perception.py", "predictor.py", "selector.py", "solv
               "diagnose_stage1.py --self-test", "probe_depth.py --self-test", "clearance.py",
               "sim/fly_policy.py --self-test", "sim/summarize_flights.py --self-test", "envelope_check.py --self-test",
               "sim/show_trace.py --self-test", "input_sensitivity.py --self-test", "sim/dagger.py",
-              "sim/shield.py")
+              "sim/shield.py", "sim/crash_study.py --self-test", "sim/paired_stats.py --self-test",
+              "scripts/release/package_release.py --self-test", "scripts/release/upload_hf.py --self-test")
 LINT_COMMAND = ("ruff", "check", "--select", "F,E9,B,PLE,PLW", ".")
 EXPECTED_FILES = (
     *(command.split()[0] for command in SELF_TESTS),
@@ -74,6 +75,9 @@ EXPECTED_FILES = (
     "docs/preprint_261026.pdf",
     "scripts/check_release.py",
     "scripts/release.sh",
+    "scripts/release/release_manifest.json",
+    "docs/RELEASE.md",
+    "sim/run_benchmark.sh",
     ".github/workflows/selftest.yml",
     "inspect_hdf5.py",
     "sim/collect_expert_dataset.py",
@@ -94,11 +98,13 @@ FORBIDDEN_PATTERNS = (
     "*.pyc", "*.pyo", "__pycache__/*", "*/__pycache__/*", ".ruff_cache/*", ".pytest_cache/*",
     "*.egg-info/*", "*.pt", "*.pth", "*.ckpt", "*.safetensors", "*.onnx", "*.engine", "*.plan",
     "*.zip", "*.tar.gz", ".DS_Store", "*/.DS_Store", "Thumbs.db", ".env", "*.pem", "*.key",
+    # data and media: published on Hugging Face (docs/RELEASE.md), never in git
+    "*.hdf5", "*.h5", "*.parquet", "*.jsonl", "*.jsonl.gz", "*.mp4", "*.mov", "*.webm", "*.tar", "*.zst",
 )
 MAX_FILE_BYTES = 5 * 1024 * 1024                      # the preprint PDF is ~0.4 MB
-BUILD_MACHINE_PATHS = re.compile(rb"/home/claude|/mnt/user-data|/tmp/claude-|/root/\.")
-SECRET_PATTERNS = re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}")
-TEXT_SUFFIXES = {".py", ".md", ".txt", ".cff", ".yml", ".yaml", ".sh", ".toml", ".cfg", ".sdf", ".config", ""}
+BUILD_MACHINE_PATHS = re.compile(rb"/home/claude|/home/ylee|/mnt/user-data|/tmp/claude-|/root/\.")
+SECRET_PATTERNS = re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|hf_[A-Za-z0-9]{30,}")
+TEXT_SUFFIXES = {".py", ".md", ".txt", ".cff", ".yml", ".yaml", ".sh", ".toml", ".cfg", ".sdf", ".config", ".json", ""}
 
 
 class Report:

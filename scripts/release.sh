@@ -14,6 +14,7 @@
 #   --skip-tests      run the static checks only, not ruff and the six self-tests
 #   --sign            GPG-sign the commit and the tag
 #   --remote URL      expected origin (default: git@github.com:ylee-sling/Aero-VPA.git)
+#   --notes FILE      Markdown notes of the GitHub Release (default: the built-in v1.0.0 notes: no weights)
 #   --python PATH     interpreter for the checks (default: $PYTHON or python3; Python >= 3.10)
 #   -h, --help        show this help
 #
@@ -33,6 +34,7 @@ GH_RELEASE=0
 RUN_TESTS=1
 SIGN=0
 VERSION=""
+NOTES_FILE=""
 
 die() { printf 'release.sh: error: %s\n' "$*" >&2; exit 1; }
 info() { printf '==> %s\n' "$*"; }
@@ -43,6 +45,7 @@ while [ $# -gt 0 ]; do
         --version) [ $# -ge 2 ] || die "--version needs a value"; VERSION="${2#v}"; shift 2 ;;
         --remote)  [ $# -ge 2 ] || die "--remote needs a value"; REMOTE_URL="$2"; shift 2 ;;
         --python)  [ $# -ge 2 ] || die "--python needs a value"; PY="$2"; shift 2 ;;
+        --notes)   [ $# -ge 2 ] || die "--notes needs a value"; NOTES_FILE="$2"; shift 2 ;;
         --push) PUSH=1; shift ;;
         --gh-release) GH_RELEASE=1; shift ;;
         --skip-tests) RUN_TESTS=0; shift ;;
@@ -52,6 +55,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ "$GH_RELEASE" -eq 0 ] || [ "$PUSH" -eq 1 ] || die "--gh-release requires --push"
+[ -z "$NOTES_FILE" ] || [ -f "$NOTES_FILE" ] || die "--notes: no file '$NOTES_FILE'"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -152,6 +156,9 @@ if [ "$GH_RELEASE" -eq 1 ]; then
     else
         NOTES="$(mktemp)"
         trap 'rm -f "$NOTES"' EXIT
+        if [ -n "$NOTES_FILE" ]; then
+            cp "$NOTES_FILE" "$NOTES"
+        else
         cat > "$NOTES" <<EOF
 Reference PyTorch implementation of the preprint **${TITLE}** (https://doi.org/${DOI}).
 
@@ -163,6 +170,7 @@ Reference PyTorch implementation of the preprint **${TITLE}** (https://doi.org/$
 **License.** Code: GPL-3.0-only. The preprint PDF in \`docs/\` is not covered by the GPL: Copyright (C) 2026
 Yeonseok Lee, CC BY 4.0. For commercial integration, proprietary licensing, or defense adaptation, contact ylee@sling.ai.kr.
 EOF
+        fi
         info "creating GitHub Release $TAG"
         gh release create "$TAG" --repo "$GITHUB_REPO" --verify-tag --title "Aero-VPA ${TAG}" --notes-file "$NOTES"
     fi

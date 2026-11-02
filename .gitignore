@@ -41,3 +41,19 @@ checkpoints/
 .DS_Store
 Thumbs.db
 flights*.jsonl
+
+# Data, caches and media of the evaluation machine: published on Hugging Face (docs/RELEASE.md), never in git
+/data/
+/data_val/
+/dagger_r*/
+/latents_res/
+/release/
+/videos/
+*.jsonl
+*.jsonl.gz
+*.parquet
+*.mp4
+*.mov
+*.webm
+*.tar
+*.zst

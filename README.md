@@ -53,8 +53,10 @@ objectives, the safety layer and Algorithm 1 (decision loop and 100 Hz executor)
 Section 5.1, and an HDF5 writer whose files `dataset.py` loads. The training scripts run stages (i) and (ii) of
 Section 3.8 on those files, calibrate the uncertainty thresholds of Section 3.5, and write one checkpoint that
 `VPAInferencePipeline.from_checkpoint` loads.
-The preprint specifies its benchmark protocol before execution and reports **no experimental results**; this
-release likewise ships **no trained weights, no demonstrations and no flight results**. ROS 2 control nodes,
+The preprint specifies its benchmark protocol before execution and reports **no experimental results**. The git
+repository ships **no trained weights, no demonstrations and no flight results**: trained weights and the
+closed-loop evaluation records are packaged for Hugging Face by `scripts/release/` (what goes where:
+[`docs/RELEASE.md`](docs/RELEASE.md)). ROS 2 control nodes,
 TensorRT engines and the HITL harness of Sections 4-5 are deployment targets of the paper and are not part of
 this release.
 
@@ -124,6 +126,10 @@ python sim/show_trace.py --self-test
 python input_sensitivity.py --self-test
 python sim/dagger.py       # stage (iii): expert labels, takeover gate and recording on a kinematic vehicle
 python sim/shield.py       # onboard safety shield (fly_policy.py --shield): depth memory, barrier, backoff
+python sim/crash_study.py --self-test   # where traced missions crashed, relative to the camera
+python sim/paired_stats.py --self-test  # paired successes and crashes of the shielded benchmark
+python scripts/release/package_release.py --self-test   # Hugging Face release staging (weights, records, cards)
+python scripts/release/upload_hf.py --self-test         # upload of the staged release (stand-in for the Hub)
 
 # the release checks: headers, licence files, citation metadata, lint and all self-tests
 python scripts/check_release.py --run-tests
@@ -304,6 +310,22 @@ A policy that follows a swapped last command a_bar_t and ignores a swapped image
 previous command (the copycat shortcut of imitation from action histories): near-perfect on recorded frames,
 blind to obstacles and waypoints in flight.
 
+### The shielded benchmark
+
+Six calibrated checkpoints, each flown without and with the onboard safety shield over the 36 test worlds x 5
+missions on three simulators (`sim/run_benchmark.sh` splits the worlds and resumes), then paired mission by
+mission. The record files and tags below are the ones the paper's numbers come from
+(`scripts/release/release_manifest.json` lists all six).
+
+```bash
+sim/run_benchmark.sh --stem flights_r1 policy_r1_cal_ep.pt checkpoints/policy_r1_cal_ep.pt          # no shield
+sim/run_benchmark.sh --shield --stem flights_shield_r1 r1_shield checkpoints/policy_r1_cal_ep.pt    # shield
+python3 sim/summarize_flights.py flights_r1_i*.jsonl flights_shield_r1_i*.jsonl --compare policy_r1_cal_ep.pt r1_shield
+python3 sim/paired_stats.py        # all six: endings, paired successes and crashes, hold-out missions, densities
+# where traced missions crashed (runs flown with --trace DIR)
+python3 sim/crash_study.py 'logs/trace_r1/*.jsonl'
+```
+
 ## Phase 4: dataset aggregation (stage iii, DAgger)
 
 `sim/fly_policy.py --dagger_dir DIR` flies the policy and records every frame with the privileged expert's command
@@ -373,13 +395,16 @@ vehicle, and it counts crashes by who was flying, re-plans, expert brakes and fa
 | `sim/dagger.py` | Sec. 3.8 (iii) | DAgger: expert labels at the policy's states, takeover gate, segment recording |
 | `sim/shield.py` | | Onboard safety shield for evaluation (`fly_policy.py --shield`): depth memory, barrier on remembered obstacles, blind-motion cap, latency and uncertainty holds, altitude floor, breadcrumb backoff; no map |
 | `sim/dagger_round.sh` | Sec. 3.8 (iii) | one DAgger round: flights, latent caches, stage (ii) on the aggregate, calibration |
+| `sim/run_benchmark.sh` | Sec. 5 | one checkpoint over the test worlds on several simulators at once (36 worlds x 5 missions, 3 simulators), resumable |
+| `sim/paired_stats.py` | Sec. 5 | the shielded benchmark paired mission by mission: endings, successes and crashes (exact McNemar), hold-out missions, densities |
+| `sim/crash_study.py` | Sec. 5 | where traced missions crashed: the obstacle hit relative to the camera, motion and mode in the last second |
 | `envelope_check.py` | Secs. 3.3-3.6 | envelope and blind rule on expert flights; the policy on the same frames, open loop |
 | `input_sensitivity.py` | Secs. 3.3-3.4 | which inputs the policy's decision follows (one input swapped between frames at a time) |
 | `sim/collect_worlds.sh` | Sec. 5.1 | resumable sweep over many worlds: restarts, appends, skips complete worlds |
 | `sim/run_headless_sitl.sh` | Secs. 4.3, 5.1 | headless gz + PX4 SITL + uXRCE-DDS + ros_gz_bridge, with clean shutdown |
 | `sim/make_world.py`, `sim/models/` | Sec. 5.1 | E1 forest worlds with privileged maps; the `x500_vpa` RGB-D vehicle |
 | `docs/` | | the preprint PDF (CC BY 4.0, see [`docs/README.md`](docs/README.md)) |
-| `scripts/` | | `check_release.py` (release hygiene), `release.sh` (tag and publish) |
+| `scripts/` | | `check_release.py` (release hygiene), `release.sh` (tag and publish); `release/`: Hugging Face release of weights and evaluation records (`package_release.py`, `upload_hf.py`, `release_manifest.json`; see [`docs/RELEASE.md`](docs/RELEASE.md)) |
 | `.github/workflows/` | | CI: release checks, lint and self-tests on Python 3.10 and 3.13 (CPU) |
 
 ## Verification
