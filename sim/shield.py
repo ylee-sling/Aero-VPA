@@ -15,11 +15,11 @@ outputs (sigma_bar, decision times). It filters every setpoint of the executor a
                 (d - radius))), negative inside the radius (it moves away); motion past an obstacle is kept;
     blind       horizontal motion in a direction the camera does not see (outside the HFOV) is capped at
                 ``blind_speed`` unless it follows the breadcrumbs (the path flown so far, known free) back;
-    uncertainty sigma_bar above sigma_lo caps the speed at ``sigma_speed``;
+    uncertainty sigma_bar above sigma_lo caps the speed at ``sigma_speed`` (off by default);
     latency     no decision for ``stale_s``: hold (zero velocity) until the next one;
     altitude    below ``min_altitude`` above home ground: climb at ``climb_speed`` at least;
     backoff     closer than ``hard_radius`` to a remembered point: retrace the breadcrumbs for ``backoff_m`` at
-                ``backoff_speed``, then nudge toward the active waypoint (``nudge_s`` at ``nudge_speed``, turning
+                ``backoff_speed`` (through the barrier; it ends when the barrier blocks it), then nudge toward the active waypoint (``nudge_s`` at ``nudge_speed``, turning
                 the camera to it, through the barrier), so that a policy that repeats its last command does not
                 stay at rest;
     stall       no progress toward the active waypoint for ``stall_s``: the same nudge.
@@ -73,11 +73,12 @@ class ShieldConfig:
     min_altitude: float = 0.8       # climb below this height (m)
     climb_speed: float = 0.5        # (m/s)
     stale_s: float = 0.3            # hold after this long without a decision (s)
-    sigma_speed: float = 1.0        # speed cap while sigma_bar > sigma_lo (m/s)
+    sigma_speed: float = math.inf   # speed cap while sigma_bar > sigma_lo (m/s; off: in SITL it held the vehicle
+                                    # at 1 m/s for 18 s of every mission and turned flights into timeouts)
     blind_speed: float = 0.7        # horizontal speed allowed in directions the camera does not see (m/s)
     crumb_spacing: float = 0.25     # breadcrumb every this far (m)
     backoff_m: float = 1.0          # retrace this far (m)
-    backoff_speed: float = 0.5      # (m/s)
+    backoff_speed: float = 0.3      # (m/s)
     stall_s: float = 5.0            # nudge after this long without 0.3 m of progress (s)
     nudge_s: float = 1.0            # (s, after the camera faces the waypoint)
     nudge_speed: float = 0.6        # (m/s)
@@ -227,11 +228,16 @@ class SafetyShield:
             if was_backing_off:
                 self.backoff_left -= moved
             cmd = self._backoff(p, near)
+            if cmd is not None:                    # the barrier and the altitude floor hold during the backoff too
+                cmd, _, _ = self._filters(p, v, yaw, cmd, np.zeros(3), reasons)
+                if float(np.linalg.norm(cmd)) < 0.25 * c.backoff_speed:
+                    cmd = None                         # blocked behind as well: stop backing off
             if cmd is None:
                 self._start_nudge(t) if target is not None else self._enter(FLY, t)
+                reasons = []
             else:
                 self.seconds[BACKOFF] += dt
-                self.reasons = (BACKOFF,)
+                self.reasons = (BACKOFF, *reasons)
                 return Setpoint(cmd, np.zeros(3), 0.0, True, True)
         if self.mode == NUDGE:
             if target is None or t >= self.nudge_until:
@@ -340,14 +346,6 @@ class SafetyShield:
             acc *= c.sigma_speed / speed
             reasons.append("sigma")
             changed = True
-        h = vel[:2]
-        hs = float(np.linalg.norm(h))
-        if hs > c.blind_speed and abs(_wrap(math.atan2(h[1], h[0]) - yaw)) > self.half_fov \
-                and not self._along_crumbs(p, h):
-            vel[:2] *= c.blind_speed / hs
-            acc[:2] *= c.blind_speed / hs
-            reasons.append("blind")
-            changed = True
         if len(self.local):
             q = p + v * c.lookahead_s
             dv = self.local - q[None, :]
@@ -368,6 +366,15 @@ class SafetyShield:
             if hit:
                 reasons.append("barrier")
                 changed = True
+        # after the barrier, so that a slide around a trunk that leaves the camera's view is capped as well
+        h = vel[:2]
+        hs = float(np.linalg.norm(h))
+        if hs > c.blind_speed and abs(_wrap(math.atan2(h[1], h[0]) - yaw)) > self.half_fov \
+                and not self._along_crumbs(p, h):
+            vel[:2] *= c.blind_speed / hs
+            acc[:2] *= c.blind_speed / hs
+            reasons.append("blind")
+            changed = True
         return vel, acc, changed
 
 
@@ -433,7 +440,8 @@ def _self_test() -> None:
     sh3.last_frame = 1.0
     out = run(sh3, 0.2, np.array([0.0, 0.0, -2.0]), np.zeros(3), 0.0, [0.0, -1.5, 0.0])  # back west: allowed
     assert not out.changed and abs(out.velocity[1] + 1.5) < 1e-9, out
-    # altitude floor and the uncertainty cap
+    # altitude floor (and the uncertainty cap, off by default)
+    assert not math.isfinite(sh.cfg.sigma_speed)
     sh.sigma_high = True
     out = run(sh, 0.04, np.array([0.0, 0.0, -0.6]), np.zeros(3), 0.0, [0.0, 0.3, 0.8])
     assert out.velocity[2] <= -0.5 + 1e-9 and "altitude" in sh.reasons
@@ -479,6 +487,23 @@ def _self_test() -> None:
         out = run(sh5, 0.01 * k, p0, np.zeros(3), 0.0, [0.0, 0.0, 0.0], behind)
     assert sh5.counts["stalls"] == 1 and sh5.mode == NUDGE and out.takeover and abs(out.yaw_rate) > 0.5
     assert np.allclose(out.velocity, 0.0)                                                # turning before moving
+    # the backoff goes through the barrier: a remembered point on the breadcrumbs behind ends it
+    sh7 = SafetyShield(camera=cam)
+    sh7.reset(0.0, np.array([-1.0, 0.0, -2.0]))
+    for k in range(5):
+        run(sh7, 0.05 * k, np.array([-1.0 + 0.25 * k, 0.0, -2.0]), np.zeros(3), 0.0, [0.0, 0.0, 0.0])
+    sh7.last_frame = 1.0
+    sh7.local = np.array([[0.3, 0.0, -2.0], [-0.57, 0.0, -2.0]])             # one ahead, one on the trail behind
+    out = run(sh7, 0.3, np.array([0.0, 0.0, -2.0]), np.zeros(3), 0.0, [1.0, 0.0, 0.0], np.array([10.0, 0.0, -2.0]))
+    assert sh7.counts["backoffs"] == 1 and sh7.mode == NUDGE, sh7.mode
+    # a slide around a trunk that leaves the camera's view is capped like any unseen motion
+    sh8 = SafetyShield(camera=cam)
+    sh8.reset(0.0, p0)
+    sh8.last_frame = 1.0
+    sh8.local = np.array([[0.8, 0.0, -2.0]])                                   # 0.8 m straight ahead
+    out = run(sh8, 0.5, p0, np.zeros(3), 0.0, [1.5, 1.5, 0.0])                # 45 deg: in the barrier's way
+    assert "barrier" in sh8.reasons and "blind" in sh8.reasons, sh8.reasons
+    assert float(np.linalg.norm(out.velocity[:2])) <= sh8.cfg.blind_speed + 1e-6
     # a frame of a forest costs little
     sh6 = SafetyShield(camera=cam)
     sh6.reset(0.0, p0)
