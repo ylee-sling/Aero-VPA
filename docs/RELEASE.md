@@ -10,8 +10,8 @@ their manifests.
 | where | what | size |
 |---|---|---|
 | GitHub `ylee-sling/Aero-VPA` (public) | code, scripts, world generator, vehicle model, docs, preprint | about 1 MB (33 commits) |
-| Hugging Face model repo `<ns>/aero-vpa` | 9 policy checkpoints, 1–2 stage-(i) checkpoints, videos, model card | about 1 GB |
-| Hugging Face dataset repo `<ns>/aero-vpa-benchmark` | mission records, missions table, decision traces, worlds, reports, dataset card | a few hundred MB |
+| Hugging Face model repo `ylee-sling/aero-vpa` | 9 policy checkpoints, 1–2 stage-(i) checkpoints, videos, model card | about 1 GB |
+| Hugging Face dataset repo `ylee-sling/aero-vpa-benchmark` | mission records, missions table, decision traces, worlds, reports, dataset card | a few hundred MB |
 | not released (stays on the VM) | demonstrations, validation flights, DAgger frames, latent caches, training states | hundreds of GB; `--dry_run` prints the sizes |
 
 The git history needs no rewrite. On 3 Nov 2026 the full history (33 commits, 1.0 MB packed, largest blob the
@@ -37,7 +37,7 @@ annotated tags on `main`, never a rewritten history: commit ids are cited in the
 - **Worlds:**
   - Regenerate them with `python3 sim/make_world.py --seed 2000 --count 12 --density sparse medium dense --out sim/worlds/test`.
   - Or take the files the paper flew from the dataset's `worlds/test/`. Their SHA-256 sums are in its `MANIFEST.json`, so a regenerated set can be compared against them.
-- **Weights:** `hf download <ns>/aero-vpa --include "checkpoints/*" --local-dir .` puts them where the commands expect them.
+- **Weights:** `hf download ylee-sling/aero-vpa --include "checkpoints/*" --local-dir .` puts them where the commands expect them.
 - **Runs:** `sim/run_benchmark.sh` (README, "The shielded benchmark"), then `sim/paired_stats.py` and `sim/crash_study.py`.
 
 **Never committed.** These are ignored by `.gitignore`, and `check_release.py` refuses them even when force-added:
@@ -62,7 +62,7 @@ The VM-only scripts in `logs/` (`run_*.sh`, `status.py`, `failure_study.py`, `pa
 
 Zenodo's GitHub integration can mint a software DOI for the tag.
 
-## 2. Hugging Face model repository `<ns>/aero-vpa`
+## 2. Hugging Face model repository `ylee-sling/aero-vpa`
 
 | file | name | role |
 |---|---|---|
@@ -93,7 +93,7 @@ Zenodo's GitHub integration can mint a software DOI for the tag.
 9. Limitations: simulation only, about 1.2 m/s, about half the missions succeed.
 10. Licence and citation.
 
-## 3. Hugging Face dataset repository `<ns>/aero-vpa-benchmark`
+## 3. Hugging Face dataset repository `ylee-sling/aero-vpa-benchmark`
 
 | path | contents | format |
 |---|---|---|
@@ -110,30 +110,31 @@ Zenodo's GitHub integration can mint a software DOI for the tag.
 - Traces stay one gzipped file per mission. They are lossless and `crash_study.py` reads them directly.
 - There are no tarballs. The viewer cannot read inside an archive, users could not download parts of one, and the Hub's Xet storage could not deduplicate it.
 
-**Training data is not part of this release.** The demonstrations (about 1.7 GB per world × 200) can be regenerated with the expert. The three DAgger rounds (about 140 MB per mission file) cannot. If they are released later, a separate, possibly gated repository (`<ns>/aero-vpa-dagger`) keeps the benchmark small.
+**Training data is not part of this release.** The demonstrations (about 1.7 GB per world × 200) can be regenerated with the expert. The three DAgger rounds (about 140 MB per mission file) cannot. If they are released later, a separate, possibly gated repository (`ylee-sling/aero-vpa-dagger`) keeps the benchmark small.
 
 Free accounts get best-effort public storage on the Hub "beyond the first few gigabytes"
 ([storage limits](https://huggingface.co/docs/hub/storage-limits)).
 
 ## 4. Media
-- **Model repository:** the six MP4s go to its `media/`. The card embeds them with `<video src="https://huggingface.co/<ns>/aero-vpa/resolve/main/media/<file>.mp4">`.
+- **Making them:** `sim/make_demo_videos.sh` (in tmux on the VM) picks, per density, a test mission that r1 and kw both succeeded on with the shield, re-flies it with `fly_policy.py --shield --trace --frames` on simulator instance 3, and renders `videos/<name>_<density>.mp4`, a poster `.jpg` and a `.json` with `sim/render_fpv.py`. A mission is used only if every checkpoint succeeds on it again; `videos/videos.json` lists every re-flight.
+- **Model repository:** the six MP4s go to its `media/` with their posters and `videos.json`. The card embeds them with `<video src="https://huggingface.co/ylee-sling/aero-vpa/resolve/main/media/<file>.mp4">`.
 - **GitHub README:** links to the model card. MP4s never enter git.
 - **GitHub Release:** the videos can also be attached as release assets, which do not enter the history.
 
-## 5. Decisions before publishing
-1. **Hugging Face namespace:** a SLING AI organisation or a personal account.
-2. **Licence of the weights.** The default `gpl-3.0` keeps one licence for code and weights, together with the commercial-licensing statement. `cc-by-nc-4.0` forbids commercial use outright, but it is not an open-source licence.
-3. **Licence of the dataset:** default `cc-by-4.0`.
-4. **When to go public.** Upload private, review, then publish with `upload_hf.py --public`. For a double-blind venue, keep the repositories private (or anonymous) until the decision.
-5. **Training data:** whether and when to release it.
+## 5. Decisions (Dr. Lee, 3 Nov 2026)
+1. **Hugging Face namespace:** the account `ylee-sling` (`ylee-sling/aero-vpa`, `ylee-sling/aero-vpa-benchmark`).
+2. **Licence of the weights:** `gpl-3.0`, the same as the code, with the commercial-licensing statement.
+3. **Licence of the dataset:** `cc-by-4.0`.
+4. **Visibility:** public (no double-blind submission planned). The upload still goes private first, is checked against the manifests, and is then made public with `upload_hf.py --public`.
+5. **Training data:** not part of this release.
 
 ## 6. Procedure on the VM
 
 ```bash
 cd ~/Aero-VPA && git pull --ff-only && python3 -m pip install --user -U "huggingface_hub>=0.32" pyarrow
 python3 scripts/release/package_release.py --dry_run            # inventory and card numbers, writes nothing
-python3 scripts/release/package_release.py --namespace <ns>     # stages release/models/aero-vpa, release/datasets/...
-hf auth login                                                   # a write token of <ns>
-python3 scripts/release/upload_hf.py --namespace <ns>           # private, uploaded, verified
-python3 scripts/release/upload_hf.py --namespace <ns> --tag v1.1.0 --public   # release day
+python3 scripts/release/package_release.py --namespace ylee-sling     # stages release/models/aero-vpa, release/datasets/...
+hf auth login                                                   # a write token of ylee-sling
+python3 scripts/release/upload_hf.py --namespace ylee-sling           # private, uploaded, verified
+python3 scripts/release/upload_hf.py --namespace ylee-sling --tag v1.1.0 --public   # release day
 ```

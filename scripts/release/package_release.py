@@ -185,7 +185,8 @@ def print_inventory(inv: Dict[str, Any], root: str, model_id: str, dataset_id: s
     print("== model repository %s" % model_id)
     for c in inv["checkpoints"]:
         print("  checkpoints/%-32s %9s  %-7s %s" % (os.path.basename(c["file"]), human(c["bytes"]), c["group"], c["name"]))
-    print("  media/: %d videos, %s" % (len(inv["media"]), human(size(inv["media"]))))
+    print("  media/: %d files (%d videos), %s" % (len(inv["media"]), sum(m.endswith(".mp4") for m in inv["media"]),
+                                                  human(size(inv["media"]))))
     for m in inv["media"]:
         print("    %s (%s)" % (m, human(os.path.getsize(os.path.join(root, m)))))
     print("\n== dataset repository %s" % dataset_id)
@@ -478,17 +479,36 @@ def checkpoint_table(entries: Sequence[Dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def video_block(media: Sequence[str], model_id: str, posters: Sequence[str] = ()) -> str:
+def video_captions(index: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """Caption per video file from the videos.json of sim/make_demo_videos.sh (sim/render_fpv.py index)."""
+    out: Dict[str, str] = {}
+    for v in (index or {}).get("videos", []):
+        world = str(v.get("world", "")).replace("aero_forest_", "")
+        out[str(v.get("video"))] = "%s: %s world %s, mission %s; %s, %s/%s waypoints in %.0f s, mean %.2f m/s" % (
+            v.get("title", ""), v.get("density", ""), world.split("_")[-1], v.get("episode"),
+            str(v.get("termination", "")), v.get("waypoints_reached"), v.get("waypoints"),
+            float(v.get("duration_s") or 0.0), float(v.get("mean_speed") or 0.0))
+    return out
+
+
+def video_block(media: Sequence[str], model_id: str, posters: Sequence[str] = (),
+                captions: Optional[Dict[str, str]] = None) -> str:
     """Video players for the model card (files in media/, served from the repository's main branch)."""
-    if not media:
+    videos = [m for m in media if m.lower().endswith((".mp4", ".webm", ".mov"))]
+    if not videos:
         return ""
     base = "https://huggingface.co/%s/resolve/main/media/" % model_id
     lines = ["## Videos", ""]
-    for rel in media:
+    if captions:
+        lines += ["FPV re-flights, for illustration, of test missions that both checkpoints succeeded on in the "
+                  "benchmark, recorded from the onboard camera (`sim/make_demo_videos.sh`). `media/videos.json` lists "
+                  "every re-flight; the tables above come from the benchmark runs only.", ""]
+    for rel in videos:
         name = os.path.basename(rel)
         poster = os.path.splitext(name)[0] + ".jpg"
         attr = ' poster="%s%s"' % (base, poster) if poster in posters else ""
-        lines += ["**%s**" % os.path.splitext(name)[0].replace("_", " "), "",
+        title = (captions or {}).get(name) or os.path.splitext(name)[0].replace("_", " ")
+        lines += ["**%s**" % title, "",
                   '<video controls muted width="640"%s src="%s%s"></video>' % (attr, base, name), ""]
     return "\n".join(lines) + "\n"
 
@@ -664,15 +684,22 @@ def stage(args: argparse.Namespace, manifest: Dict[str, Any], root: str) -> Dict
         model_src[rel] = {"source": c["file"], "source_sha256": info["source_sha256"],
                           "checkpoint_id": info["checkpoint_id"], "note": "strings scrubbed; tensors identical"}
         print("  staged %s (%s, %.2fM parameters)" % (rel, info["kind"], info["parameters"] / 1e6))
+    captions: Dict[str, str] = {}
     for rel in inv["media"]:
         dst = os.path.join("media", os.path.basename(rel))
         os.makedirs(os.path.join(model_dir, "media"), exist_ok=True)
-        shutil.copy2(os.path.join(root, rel), os.path.join(model_dir, dst))
+        if rel.endswith(".json"):
+            copy_text(os.path.join(root, rel), os.path.join(model_dir, dst), scrub)
+            with open(os.path.join(model_dir, dst), encoding="utf-8") as f:
+                captions.update(video_captions(json.load(f)))
+        else:
+            shutil.copy2(os.path.join(root, rel), os.path.join(model_dir, dst))
         model_src[dst] = {"source": rel}
-        if args.posters and shutil.which("ffmpeg"):
-            poster = os.path.splitext(dst)[0] + ".jpg"
+    for rel in inv["media"]:                        # a poster for every video without one of its own
+        poster = os.path.join(model_dir, "media", os.path.splitext(os.path.basename(rel))[0] + ".jpg")
+        if rel.lower().endswith(".mp4") and args.posters and shutil.which("ffmpeg") and not os.path.exists(poster):
             subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", "2", "-i", os.path.join(root, rel),
-                            "-frames:v", "1", "-vf", "scale=640:-2", os.path.join(model_dir, poster)], check=False)
+                            "-frames:v", "1", "-vf", "scale=640:-2", poster], check=False)
 
     # dataset repository: records, missions table, traces, worlds, reports
     rows = []
@@ -724,7 +751,8 @@ def stage(args: argparse.Namespace, manifest: Dict[str, Any], root: str) -> Dict
                                       n_missions=n_missions, checkpoints=checkpoint_table(entries),
                                       videos=video_block([os.path.basename(m) for m in inv["media"]], model_id,
                                                          os.listdir(os.path.join(model_dir, "media"))
-                                                         if os.path.isdir(os.path.join(model_dir, "media")) else ())))
+                                                         if os.path.isdir(os.path.join(model_dir, "media")) else (),
+                                                         captions)))
     size_category = "n<1K" if len(rows) < 1000 else ("1K<n<10K" if len(rows) < 10000 else "10K<n<100K")
     with open(os.path.join(data_dir, "README.md"), "w", encoding="utf-8") as f:
         f.write(DATASET_CARD.substitute(common, license_id=args.data_license,
@@ -821,6 +849,14 @@ def _self_test() -> None:
         os.makedirs(os.path.join(root, "videos"))
         with open(os.path.join(root, "videos", "r1_shield_dense.mp4"), "wb") as f:
             f.write(b"\x00\x00\x00\x18ftypmp42")
+        with open(os.path.join(root, "videos", "r1_shield_dense.jpg"), "wb") as f:
+            f.write(b"\xff\xd8\xff\xe0poster")
+        with open(os.path.join(root, "videos", "videos.json"), "w", encoding="utf-8") as f:
+            json.dump({"videos": [{"video": "r1_shield_dense.mp4", "title": "Aero-VPA r1 + onboard safety shield",
+                                   "world": "aero_forest_dense_s2004", "density": "dense", "episode": 2,
+                                   "termination": "success", "waypoints": 4, "waypoints_reached": 4,
+                                   "duration_s": 61.2, "mean_speed": 1.31}],
+                       "reflights": [{"tag": "r1_shield_video", "world": abs_root + "/x"}]}, f)
         manifest = {"format": "aero-vpa/release-manifest", "model_repo": "m", "dataset_repo": "d",
                     "checkpoints": [{"name": "r1", "file": "checkpoints/policy_r1_cal_ep.pt", "group": "dagger",
                                      "recommended": True, "description": "test policy"},
@@ -832,7 +868,8 @@ def _self_test() -> None:
                                    "shielded": "flights_shield_r1_i*.jsonl"}],
                     "records": ["flights*.jsonl", "dagger_r[0-9]*_i[0-9]*.jsonl"], "traces": ["logs/trace_r1"],
                     "reports": ["logs/shield_report.txt", "logs/missing_report.txt"], "worlds": ["sim/worlds/test"],
-                    "media": ["videos/*.mp4"], "not_released": {"data": "demonstrations"}}
+                    "media": ["videos/*.mp4", "videos/*.jpg", "videos/videos.json"],
+                    "not_released": {"data": "demonstrations"}}
 
         inv = inventory(manifest, root)
         assert [c["name"] for c in inv["checkpoints"]] == ["r1", "stage1_res"]
@@ -872,6 +909,11 @@ def _self_test() -> None:
         card = open(os.path.join(md, "README.md"), encoding="utf-8").read()
         assert "**18/30 (60.0%)**" in card and "license: gpl-3.0" in card and "test-org/d" in card
         assert "resolve/main/media/r1_shield_dense.mp4" in card and "| `checkpoints/stage1_res.pt` |" in card
+        assert "dense world s2004, mission 2; success, 4/4 waypoints in 61 s" in card, card
+        assert 'poster="https://huggingface.co/test-org/m/resolve/main/media/r1_shield_dense.jpg"' in card
+        with open(os.path.join(md, "media", "r1_shield_dense.jpg"), "rb") as f:
+            assert f.read() == b"\xff\xd8\xff\xe0poster"                  # the video script's own poster, kept
+        assert "<video" not in video_block(["videos.json", "a.jpg"], "o/m")
         assert video_block(["a.mp4"], "o/m", ["a.jpg"]).count('poster="https://huggingface.co/o/m/resolve/main/media/a.jpg"') == 1
         dcard = open(os.path.join(dd, "README.md"), encoding="utf-8").read()
         assert "license: cc-by-4.0" in dcard and "missions/missions." in dcard and "(60 rows)" in dcard

@@ -57,3 +57,7 @@ flights*.jsonl
 *.webm
 *.tar
 *.zst
+# leftovers of the evaluation machine's working tree
+/frame_*.png
+/*.patch
+/sim/worlds_extra/

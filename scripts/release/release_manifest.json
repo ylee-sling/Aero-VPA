@@ -44,7 +44,7 @@
               "logs/eval_r2_report.txt", "logs/paper_numbers.txt", "logs/dev_report.txt",
               "logs/input_sensitivity*.txt", "logs/envelope_check*.txt"],
   "worlds": ["sim/worlds/test", "sim/worlds/dev"],
-  "media": ["videos/*.mp4"],
+  "media": ["videos/*.mp4", "videos/*.jpg", "videos/videos.json"],
   "not_released": {
     "data": "expert demonstrations (HDF5); regenerable with sim/collect_worlds.sh",
     "data_val": "validation flights (HDF5) used by calibrate_sigma.py",

@@ -39,6 +39,10 @@ DIR/<world>.hdf5 in the demonstration schema (sim/dagger_round.sh runs a whole r
 obstacles, blind-motion cap, sigma and latency holds, altitude floor, breadcrumb backoff and a nudge toward the
 waypoint); the record's "shield" field gives its interventions. It does not combine with --dagger_dir.
 
+--frames DIR records the RGB-D frame of every decision to DIR/<tag>_<world>_e<k>.frames (fixed-size records: time,
+RGB, depth in mm; layout in the .frames.json beside it), one record per --trace row; sim/render_fpv.py turns a frames
+file and its trace into an FPV video.
+
 --trace DIR also writes every decision of every mission to DIR/<tag>_<world>_e<k>.jsonl (the first line is the
 mission record): the state estimate, the active waypoint, the selected and final primitive, sigma and the gate,
 the raw and committed first knot, d_t with the blind reason and the direction in the camera, v_safe and s_t,
@@ -115,6 +119,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "beyond its range)")
     p.add_argument("--collision_distance", type=float, default=0.35, help="privileged distance of a collision (m)")
     p.add_argument("--trace", default=None, metavar="DIR", help="write a per-decision trace of every mission to DIR")
+    p.add_argument("--frames", default=None, metavar="DIR",
+                   help="record every decision's RGB-D frame to DIR (for sim/render_fpv.py; use with --trace)")
     p.add_argument("--device", default="auto")
     p.add_argument("--warmup", type=int, default=3,
                    help="decisions on a synthetic frame before the first mission, so that its first decision does not "
@@ -240,6 +246,13 @@ class Mission:
         self.last_acc = np.zeros(3)                         # acceleration feed-forward of the last setpoint (traces)
         self.gap_since_row = 0.0                            # longest gap between setpoints since the last trace row
         self.trace: Optional[List[Dict[str, Any]]] = [] if getattr(args, "trace", None) else None
+        self.frame_count = 0
+        self.frames_part: Optional[str] = None
+        self._frames: Optional[Any] = None
+        if getattr(args, "frames", None):                   # appended per decision: no buffer, no stall at the end
+            os.makedirs(args.frames, exist_ok=True)
+            self.frames_part = os.path.join(args.frames, ".mission_%d_%x.frames.part" % (os.getpid(), id(self)))
+            self._frames = open(self.frames_part, "wb")
         self.shield: Optional[SafetyShield] = None
         if getattr(args, "shield", False):
             if dagger is not None:
@@ -319,6 +332,11 @@ class Mission:
                 if event is not None:                                        # its last takeover or stop
                     row["dagger_event"] = [_rounded(event[0] - self.t0, 2), event[1], event[2]]
             self.trace.append(row)
+        if self._frames is not None:                         # one record per decision, as the trace rows
+            self._frames.write(np.float64(float(stamp) - self.t0).tobytes())
+            self._frames.write(np.ascontiguousarray(image16[..., :3], dtype=np.uint8).tobytes())
+            self._frames.write(np.ascontiguousarray(image16[..., 3], dtype=np.uint16).tobytes())
+            self.frame_count += 1
         self.gap_since_row = 0.0
 
     def _trace_row(self, stamp: float, position: np.ndarray, velocity: np.ndarray, yaw: float, q: np.ndarray,
@@ -350,11 +368,34 @@ class Mission:
                        el=r(reading.elevation, 1))
         return row
 
+    @staticmethod
+    def mission_file(directory: str, record: Dict[str, Any], suffix: str) -> str:
+        """DIR/<tag>_<world>_e<k><suffix>, with characters other than letters, digits and ._- replaced."""
+        name = f"{record['tag']}_{record['world']}_e{int(record['episode']):03d}{suffix}"
+        return os.path.join(directory, "".join(c if c.isalnum() or c in "._-" else "_" for c in name))
+
+    def save_frames(self, directory: str, record: Dict[str, Any]) -> Optional[str]:
+        """Close the frames recorded with --frames as DIR/<tag>_<world>_e<k>.frames, with its layout in .frames.json."""
+        if self._frames is None or self.frames_part is None:
+            return None
+        self._frames.close()
+        self._frames = None
+        path = self.mission_file(directory, record, ".frames")
+        os.replace(self.frames_part, path)
+        h, w = E.IMAGE_SIZE
+        meta = {"format": "aero-vpa/frames", "version": 1, "count": self.frame_count, "height": h, "width": w,
+                "record_bytes": 8 + h * w * 3 + h * w * 2,
+                "record": ["t: float64, s since the mission start (as the trace's t)", "rgb: uint8 [height, width, 3]",
+                           "depth: uint16 [height, width], mm, 0 = no return"],
+                "mission": {k: record.get(k) for k in ("tag", "world", "episode", "termination", "world_json")}}
+        with open(path + ".json", "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=1)
+        return path
+
     def save_trace(self, directory: str, record: Dict[str, Any]) -> str:
         """Write DIR/<tag>_<world>_e<k>.jsonl: the mission record, then one line per decision."""
         os.makedirs(directory, exist_ok=True)
-        name = f"{record['tag']}_{record['world']}_e{int(record['episode']):03d}.jsonl"
-        path = os.path.join(directory, "".join(c if c.isalnum() or c in "._-" else "_" for c in name))
+        path = self.mission_file(directory, record, ".jsonl")
         with open(path + ".tmp", "w", encoding="utf-8") as f:
             f.write(json.dumps({"kind": "mission", **record}, sort_keys=True) + "\n")
             for row in self.trace or []:
@@ -512,7 +553,7 @@ def warm_up(policy: Policy, args: argparse.Namespace, decisions: int) -> List[fl
         return []
     cpu_rng = torch.random.get_rng_state()
     cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-    quiet = argparse.Namespace(**{**vars(args), "trace": None})
+    quiet = argparse.Namespace(**{**vars(args), "trace": None, "frames": None})
     home = np.array([0.0, 0.0, -float(args.takeoff_altitude)])
     times: List[float] = []
     try:
@@ -658,6 +699,8 @@ def run_dry(args: argparse.Namespace, physics_rate: float = 250.0, camera_rate: 
         record = mission.record(termination, _record_extra(args, policy, k, "dry_run", home))
         if args.trace:
             record["trace"] = mission.save_trace(args.trace, record)
+        if args.frames:
+            record["frames"] = mission.save_frames(args.frames, record)
         append_record(args.results, record)
         records.append(record)
         print(f"[fly] mission {k}: {termination} after {record['duration_s']:.1f} s, {record['waypoints_reached']}/"
@@ -901,6 +944,11 @@ def run_ros(args: argparse.Namespace) -> int:
                     record["trace"] = mission.save_trace(self.args.trace, record)
                 except OSError as exc:
                     self.get_logger().warning(f"could not write the trace: {exc}")
+            if self.args.frames:
+                try:
+                    record["frames"] = mission.save_frames(self.args.frames, record)
+                except OSError as exc:
+                    self.get_logger().warning(f"could not write the frames: {exc}")
             append_record(self.args.results, record)
             self.records.append(record)
             age = record["decision_age_ms"]
@@ -1156,8 +1204,9 @@ def _self_test() -> None:
                 "0.5", "--timeout_extra_s", "1", "--results", results, "--device", "cpu"]
         assert run_dry(parse_args(base + ["--episodes", "2"])) == 0
         trace_dir = os.path.join(tmp, "trace")
+        frames_dir = os.path.join(tmp, "frames")
         assert run_dry(parse_args(base + ["--episodes", "1", "--episode_start", "2", "--tag", "again",
-                                          "--trace", trace_dir])) == 0
+                                          "--trace", trace_dir, "--frames", frames_dir])) == 0
         records = [json.loads(line) for line in open(results, encoding="utf-8")]
         assert [(r["tag"], r["episode"]) for r in records] == [("policy.pt", 0), ("policy.pt", 1), ("again", 2)]
         assert all(0.0 < r["max_decision_gap_s"] < 0.5 for r in records), [r["max_decision_gap_s"] for r in records]
@@ -1173,6 +1222,14 @@ def _self_test() -> None:
         # --trace: the mission record, then one row per decision
         assert "trace" not in records[0] and os.path.isfile(records[2]["trace"])
         assert os.path.basename(records[2]["trace"]) == "again_synthetic_e002.jsonl"
+        # --frames: one fixed-size record per decision (= per trace row), the layout beside it
+        meta = json.load(open(records[2]["frames"] + ".json", encoding="utf-8"))
+        assert os.path.basename(records[2]["frames"]) == "again_synthetic_e002.frames" and "frames" not in records[0]
+        assert meta["count"] == records[2]["decisions"] == os.path.getsize(records[2]["frames"]) // meta["record_bytes"]
+        assert os.path.getsize(records[2]["frames"]) == meta["count"] * meta["record_bytes"]
+        assert not [n for n in os.listdir(frames_dir) if n.endswith(".part")]
+        first = np.fromfile(records[2]["frames"], dtype=np.float64, count=1)[0]
+        assert 0.0 <= first < 1.0, first
         lines = [json.loads(line) for line in open(records[2]["trace"], encoding="utf-8")]
         assert lines[0]["kind"] == "mission" and lines[0]["termination"] == records[2]["termination"]
         rows = lines[1:]

@@ -128,6 +128,7 @@ python sim/dagger.py       # stage (iii): expert labels, takeover gate and recor
 python sim/shield.py       # onboard safety shield (fly_policy.py --shield): depth memory, barrier, backoff
 python sim/crash_study.py --self-test   # where traced missions crashed, relative to the camera
 python sim/paired_stats.py --self-test  # paired successes and crashes of the shielded benchmark
+python sim/render_fpv.py --self-test    # FPV videos from recorded frames (fly_policy.py --frames) and traces
 python scripts/release/package_release.py --self-test   # Hugging Face release staging (weights, records, cards)
 python scripts/release/upload_hf.py --self-test         # upload of the staged release (stand-in for the Hub)
 
@@ -398,6 +399,7 @@ vehicle, and it counts crashes by who was flying, re-plans, expert brakes and fa
 | `sim/run_benchmark.sh` | Sec. 5 | one checkpoint over the test worlds on several simulators at once (36 worlds x 5 missions, 3 simulators), resumable |
 | `sim/paired_stats.py` | Sec. 5 | the shielded benchmark paired mission by mission: endings, successes and crashes (exact McNemar), hold-out missions, densities |
 | `sim/crash_study.py` | Sec. 5 | where traced missions crashed: the obstacle hit relative to the camera, motion and mode in the last second |
+| `sim/render_fpv.py`, `sim/make_demo_videos.sh` | | FPV demonstration videos: missions both checkpoints succeeded on, re-flown with `fly_policy.py --frames`, rendered (onboard RGB, depth, map, telemetry) to MP4 with posters |
 | `envelope_check.py` | Secs. 3.3-3.6 | envelope and blind rule on expert flights; the policy on the same frames, open loop |
 | `input_sensitivity.py` | Secs. 3.3-3.4 | which inputs the policy's decision follows (one input swapped between frames at a time) |
 | `sim/collect_worlds.sh` | Sec. 5.1 | resumable sweep over many worlds: restarts, appends, skips complete worlds |

@@ -60,7 +60,8 @@ SELF_TESTS = ("config.py", "perception.py", "predictor.py", "selector.py", "solv
               "sim/fly_policy.py --self-test", "sim/summarize_flights.py --self-test", "envelope_check.py --self-test",
               "sim/show_trace.py --self-test", "input_sensitivity.py --self-test", "sim/dagger.py",
               "sim/shield.py", "sim/crash_study.py --self-test", "sim/paired_stats.py --self-test",
-              "scripts/release/package_release.py --self-test", "scripts/release/upload_hf.py --self-test")
+              "sim/render_fpv.py --self-test", "scripts/release/package_release.py --self-test",
+              "scripts/release/upload_hf.py --self-test")
 LINT_COMMAND = ("ruff", "check", "--select", "F,E9,B,PLE,PLW", ".")
 EXPECTED_FILES = (
     *(command.split()[0] for command in SELF_TESTS),
@@ -78,6 +79,7 @@ EXPECTED_FILES = (
     "scripts/release/release_manifest.json",
     "docs/RELEASE.md",
     "sim/run_benchmark.sh",
+    "sim/make_demo_videos.sh",
     ".github/workflows/selftest.yml",
     "inspect_hdf5.py",
     "sim/collect_expert_dataset.py",
