@@ -8,23 +8,66 @@
 [![Hardware target: Jetson Orin Nano / L4](https://img.shields.io/badge/Hardware-Jetson%20Orin%20Nano%20%2F%20L4-76b900.svg)](#scope-of-this-release)
 [![Self-tests](https://github.com/ylee-sling/Aero-VPA/actions/workflows/selftest.yml/badge.svg)](https://github.com/ylee-sling/Aero-VPA/actions/workflows/selftest.yml)
 
+[![Model weights on Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Weights-ylee--sling%2Faero--vpa-ffcc4d.svg)](https://huggingface.co/ylee-sling/aero-vpa)
+[![Benchmark dataset on Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Dataset-aero--vpa--benchmark-ffcc4d.svg)](https://huggingface.co/datasets/ylee-sling/aero-vpa-benchmark)
+
+<p align="center">
+  <a href="https://huggingface.co/ylee-sling/aero-vpa">
+    <img src="https://huggingface.co/ylee-sling/aero-vpa/resolve/main/media/aero-vpa_fpv.gif" width="720"
+         alt="FPV flight of the r1 policy with the onboard safety shield through a dense test forest">
+  </a>
+  <br>
+  <sub>r1 + onboard safety shield in dense test world s2004 (mission 3), the whole flight at 4× speed: the onboard
+  RGB and depth frames the policy decides on, an overhead map for the viewer, telemetry. PX4 SITL + Gazebo Harmonic.
+  More videos on the <a href="https://huggingface.co/ylee-sling/aero-vpa">model card</a>.</sub>
+</p>
+
+> **Fully open.** The code (this repository, GPL-3.0-only), the trained model weights
+> ([ylee-sling/aero-vpa](https://huggingface.co/ylee-sling/aero-vpa), GPL-3.0) and the complete benchmark dataset,
+> i.e. every mission record, the decision traces, the 36 test worlds and the reports
+> ([ylee-sling/aero-vpa-benchmark](https://huggingface.co/datasets/ylee-sling/aero-vpa-benchmark), CC BY 4.0), are
+> public.
+
+**Results in simulation** (PX4 SITL + Gazebo Harmonic; 36 test worlds × 5 missions; every policy flies the same
+missions). With the onboard safety shield, the DAgger policy r1 reaches its goal in **52.2%** of missions
+(94/180, 95% CI [45.0, 59.4]) against 21.1% without it (paired exact McNemar p = 1.2 × 10⁻¹⁰), and kw in
+**50.0%** against 15.6% (p = 4.7 × 10⁻¹²). Crashes fall from 72–82% to 22–43% across six checkpoints. The model
+card has the per-density tables; `sim/paired_stats.py --root bench/records` recomputes every number from the dataset.
+
+## Framework at a glance
+
 ```mermaid
 flowchart LR
-    CAM["RGB-D camera<br/>4 × 128 × 160"] --> ENC["E_ψ · ViT encoder<br/>11.17M"]
-    ENC -->|"z_t ∈ ℝ^256"| SEL["π_φ^h · primitive selector<br/>0.67M"]
-    MIS["waypoints g_t ∈ ℝ^4 · EKF2 state S_t ∈ ℝ^13<br/>instruction c_text ∈ ℝ^512"] --> SEL
-    SEL -->|"u_t"| PRED["P_ω · 5-head JEPA ensemble<br/>2.72M"]
-    PRED -->|"ẑ_t+1"| COND["e_t ∈ ℝ^1073"]
-    PRED -->|"σ_t+1"| SAFE
-    COND --> CFM["v_θ · CFM, 2 Euler steps<br/>3.57M"]
-    CFM -->|"action chunk<br/>16 knots × 4-DoF"| SAFE["safety filter<br/>α(σ̄) · v_safe(d_t)"]
-    SAFE -->|"chunk buffer"| EXEC["executor · 100 Hz<br/>interpolate · blend · NED"]
-    EXEC -->|"uXRCE-DDS setpoints"| PX4["PX4 controller"]
-    PRED -.->|"σ̄ ≥ σ_crit: brake and hover"| EXEC
+    CAM["RGB-D camera<br/>160 × 128"] --> WM
+    subgraph WM["① JEPA latent world model"]
+        direction TB
+        ENC["ViT encoder E_ψ<br/>image → latent z_t"] --> PRED["5-head predictor P_ω<br/>z_t → ẑ 0.1 s ahead + uncertainty σ"]
+    end
+    WM --> ACT
+    GOAL["waypoint · velocity<br/>attitude · last command"] --> ACT
+    subgraph ACT["② flow-matching actor"]
+        direction TB
+        SEL["primitive selector π_φ"] --> CFM["CFM solver v_θ, 2 Euler steps<br/>→ 0.32 s velocity chunk"]
+    end
+    ACT --> SH
+    subgraph SH["③ onboard safety shield (no map)"]
+        direction TB
+        MEM["15 s 3-D depth memory"] --> BAR["barrier braking<br/>blind-motion cap"] --> BACK["breadcrumb backoff"]
+    end
+    SH -->|"100 Hz velocity setpoints"| PX4["PX4 flight controller"]
 ```
 
-Reference PyTorch implementation of **Aero-VPA**, a Vision-Predictor-Action controller for agile three-dimensional
-flight on a 15 W embedded computer. Author: Dr. Yeonseok Lee, SLING AI Inc.
+1. **World model.** A Vision Transformer embeds each RGB-D frame. A JEPA predictor, trained to predict the next
+   embedding rather than pixels, forecasts the latent state 0.1 s ahead. The disagreement of its five heads
+   measures uncertainty.
+2. **Actor.** A primitive selector and a conditional flow-matching network turn the latents, the waypoint and the
+   vehicle state into a 16-knot velocity and yaw-rate chunk in two integration steps.
+3. **Shield.** A deterministic runtime filter keeps 15 s of depth returns in a local 3-D memory, so trunks beside
+   and behind the 73° camera stay known. It limits the approach speed to every remembered obstacle (barrier) and
+   the speed of unseen motion, and backs off along the flown path when too close.
+
+Reference PyTorch implementation of **Aero-VPA**, a Vision-Predictor-Action controller for three-dimensional flight,
+designed for a 15 W embedded computer. Author: Dr. Yeonseok Lee, SLING AI Inc.
 Preprint: [doi.org/10.5281/zenodo.23633375](https://doi.org/10.5281/zenodo.23633375) (open access, Zenodo, 2026).
 
 ## Core contribution
@@ -42,6 +85,8 @@ time needed to stream billions of weights. Aero-VPA removes the decoder from the
 * **Uncertainty-gated safety.** The disagreement of a 5-head predictor ensemble attenuates speed, shortens chunk
   validity and triggers a minimum-jerk stop to hover; a model-free braking envelope limits speed to the measured
   free space.
+* **Runtime safety shield.** At deployment, a map-free filter over a 15 s depth memory brakes against remembered
+  obstacles, caps motion outside the field of view and retraces the flown path when too close (`sim/shield.py`).
 * **Edge deployment.** 18.13M parameters (~36.3 MB of FP16 weights) for an asynchronous two-rate stack on an NVIDIA
   Jetson Orin Nano streaming 100 Hz setpoints to PX4.
 
