@@ -13,7 +13,7 @@
 
 <p align="center">
   <a href="https://huggingface.co/ylee-sling/aero-vpa">
-    <img src="https://huggingface.co/ylee-sling/aero-vpa/resolve/main/media/aero-vpa_fpv.gif" width="720"
+    <img src="https://huggingface.co/ylee-sling/aero-vpa/resolve/main/media/aero-vpa_fpv_640.gif" width="720"
          alt="FPV flight of the r1 policy with the onboard safety shield through a dense test forest">
   </a>
   <br>
