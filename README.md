@@ -54,9 +54,11 @@ Section 5.1, and an HDF5 writer whose files `dataset.py` loads. The training scr
 Section 3.8 on those files, calibrate the uncertainty thresholds of Section 3.5, and write one checkpoint that
 `VPAInferencePipeline.from_checkpoint` loads.
 The preprint specifies its benchmark protocol before execution and reports **no experimental results**. The git
-repository ships **no trained weights, no demonstrations and no flight results**: trained weights and the
-closed-loop evaluation records are packaged for Hugging Face by `scripts/release/` (what goes where:
-[`docs/RELEASE.md`](docs/RELEASE.md)). ROS 2 control nodes,
+repository ships **no trained weights, no demonstrations and no flight results**. Since v1.1.0 the trained
+weights are on Hugging Face at [ylee-sling/aero-vpa](https://huggingface.co/ylee-sling/aero-vpa) (GPL-3.0, with
+FPV videos), and the closed-loop evaluation records at
+[ylee-sling/aero-vpa-benchmark](https://huggingface.co/datasets/ylee-sling/aero-vpa-benchmark) (CC BY 4.0). Both
+were staged by `scripts/release/` (what goes where: [`docs/RELEASE.md`](docs/RELEASE.md)). ROS 2 control nodes,
 TensorRT engines and the HITL harness of Sections 4-5 are deployment targets of the paper and are not part of
 this release.
 
@@ -312,6 +314,14 @@ previous command (the copycat shortcut of imitation from action histories): near
 blind to obstacles and waypoints in flight.
 
 ### The shielded benchmark
+
+The weights and every mission record of this benchmark are published:
+
+```bash
+hf download ylee-sling/aero-vpa --include "checkpoints/*" --local-dir .                 # the checkpoints below
+hf download ylee-sling/aero-vpa-benchmark --repo-type dataset --local-dir bench        # records, traces, worlds
+python3 sim/paired_stats.py --root bench/records                                       # the paired tables
+```
 
 Six calibrated checkpoints, each flown without and with the onboard safety shield over the 36 test worlds x 5
 missions on three simulators (`sim/run_benchmark.sh` splits the worlds and resumes), then paired mission by
